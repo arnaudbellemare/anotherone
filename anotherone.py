@@ -3822,10 +3822,12 @@ def fetch_all_histories_robustly(tickers, period="7y"):
     print(f"Successfully retrieved valid history for {len(histories_dict)} out of {len(tickers)} tickers.")
     return histories_dict
 
+# --- USE THIS. THIS IS THE CORRECT process_tickers FUNCTION. ---
+
 @st.cache_data
 def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
     """
-    Processes tickers using pre-fetched historical data. Accepts _all_histories.
+    Processes tickers using pre-fetched historical data. Accepts 4 arguments.
     """
     results, returns_dict, failed_tickers = [], {}, []
 
@@ -3842,7 +3844,6 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
             try:
                 all_other_data[ticker_symbol] = future.result()
             except Exception as e:
-                logging.error(f"Failed to fetch non-history data for {ticker_symbol}: {e}")
                 failed_tickers.append(ticker_symbol)
 
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -3861,7 +3862,7 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
             )
             future_to_process[future] = ticker_symbol
 
-        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing All Ticker Metrics"):
+        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing Metrics"):
             ticker = future_to_process[future]
             try:
                 result_metrics_dict, log_returns_series = future.result()
@@ -3869,17 +3870,15 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
                 if log_returns_series is not None and not log_returns_series.empty:
                     returns_dict[ticker] = log_returns_series
             except Exception as e:
-                logging.error(f"Failed to process {ticker} in future: {e}")
                 failed_tickers.append(ticker)
     
     if not results:
-        return pd.DataFrame(columns=columns), failed_tickers, {}
+        return pd.DataFrame(), failed_tickers, {}
     
     results_df = pd.DataFrame(results).reindex(columns=columns)
-
+    
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    
     for col in results_df.select_dtypes(include=np.number).columns:
         if results_df[col].isna().all():
             results_df[col] = 0.0
