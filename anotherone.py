@@ -370,7 +370,46 @@ def get_pretty_factor_name(factor_name: str) -> str:
 ################################################################################
 # SECTION 1: ALL FUNCTION DEFINITIONS
 ################################################################################
+# --- ADD THIS ENTIRE FUNCTION TO SECTION 1 OF YOUR SCRIPT ---
 
+def fetch_all_histories_robustly(tickers, period="7y"):
+    """
+    Uses the more reliable yf.download() to fetch all historical data in a single batch.
+    This is far more robust than calling .history() on each ticker individually.
+    """
+    print(f"Executing robust bulk download for {len(tickers)} tickers...")
+    
+    # Download all data in one go. yfinance handles threading internally.
+    # progress=False cleans up the terminal output.
+    all_data = yf.download(tickers, period=period, auto_adjust=True, group_by='ticker', progress=False)
+    
+    histories_dict = {}
+    
+    # Check if the download returned a DataFrame at all
+    if all_data is None or all_data.empty:
+        logging.error("CRITICAL: yf.download() returned no data at all. Check network or ticker validity.")
+        return histories_dict
+
+    # Loop through each ticker to slice its data from the multi-index DataFrame
+    for ticker in tickers:
+        try:
+            # Slicing a multi-index column; if a ticker failed, it might not exist.
+            ticker_history = all_data[ticker].dropna(how='all')
+            
+            # Final check to ensure we have meaningful, multi-row data
+            if not ticker_history.empty and len(ticker_history) > 252: # Require at least 1 year of data
+                # Localize timezone to None to match the old format and prevent issues
+                ticker_history.index = ticker_history.index.tz_localize(None)
+                histories_dict[ticker] = ticker_history
+            else:
+                logging.warning(f"No valid/sufficient history for {ticker} was found in the bulk download (rows found: {len(ticker_history)}).")
+        
+        except KeyError:
+            # This happens if a ticker was so invalid yfinance didn't even create a column for it
+            logging.warning(f"Ticker {ticker} was not found in the bulk download result DataFrame (KeyError).")
+            
+    print(f"Successfully retrieved valid history for {len(histories_dict)} out of {len(tickers)} tickers.")
+    return histories_dict
 # --- Helper Functions ---
 def calculate_growth(current, previous):
     if pd.isna(current) or pd.isna(previous) or previous == 0: return np.nan
