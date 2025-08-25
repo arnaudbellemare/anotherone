@@ -3753,39 +3753,43 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, 
             if len(close_prices) > 1:
                  log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
 
-        return result_list, log_returns
+        # BUG FIX: The original code had `return result_list, ...` which is a NameError.
+        # This returns the data as a list in the correct order defined by the global `columns` variable.
+        return [data.get(col) for col in columns], log_returns
 
     except Exception as e:
         logging.error(f"Critical error processing {ticker_symbol}: {e}", exc_info=True)
         data['Name'] = f"{ticker_symbol} (Processing Error)"
+        # Ensure a consistently shaped list is returned even on error
         return [data.get(col) for col in columns], pd.Series(dtype=float)
 # REPLACE your existing process_tickers function with this one.
-
 @st.cache_data
 def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     results, returns_dict, failed_tickers = [], {}, []
     
-    # Pre-fetch all data (this part is correct)
+    # Step 1: Pre-fetch all data in parallel
     all_ticker_data = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_fetch = {executor.submit(fetch_ticker_data, ticker): ticker for ticker in _tickers}
         for future in tqdm(as_completed(future_to_fetch), total=len(_tickers), desc="Fetching All Ticker Data"):
             ticker_symbol = future_to_fetch[future]
             try:
+                # Store the tuple of fetched data
                 all_ticker_data[ticker_symbol] = future.result()
             except Exception as e:
                 logging.error(f"Failed to fetch initial data for {ticker_symbol}: {e}")
+                # Store a placeholder for failed fetches
                 all_ticker_data[ticker_symbol] = (None, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
-    # Process each ticker using the pre-fetched data
+    # Step 2: Process each ticker using the pre-fetched data in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_process = {}
         for ticker_symbol in _tickers:
-            # Unpack the pre-fetched data
-            ticker_obj, history, info, financials, balancesheet, cashflow, q_financials, q_balancesheet, q_cashflow = all_ticker_data[ticker_symbol]
+            # Unpack the pre-fetched data tuple for the current ticker
+            (ticker_obj, history, info, financials, balancesheet, 
+             cashflow, q_financials, q_balancesheet, q_cashflow) = all_ticker_data[ticker_symbol]
             
-            # *** THIS IS THE CORRECTED CALL ***
-            # It now passes all the pre-fetched data to the function
+            # Submit the processing task, passing the fetched data as arguments
             future = executor.submit(
                 process_single_ticker, 
                 ticker_symbol, _etf_histories, _sector_etf_map, 
@@ -3797,6 +3801,7 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
         for future in tqdm(as_completed(future_to_process), total=len(_tickers), desc="Processing All Ticker Metrics"):
             ticker = future_to_process[future]
             try:
+                # The corrected process_single_ticker returns a list of metrics and a series of returns
                 result_metrics_list, log_returns_series = future.result()
                 results.append(result_metrics_list)
                 if log_returns_series is not None and not log_returns_series.empty:
@@ -3808,19 +3813,25 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
                 failed_tickers.append(ticker)
             
     if not results:
+        # If no tickers were successfully processed, return an empty DataFrame
         return pd.DataFrame(columns=columns), failed_tickers, {}
     
+    # Create the DataFrame from the consistently structured list of lists
     results_df = pd.DataFrame(results, columns=columns)
     
-    # Post-processing (this part is correct)
+    # Post-processing (this part will now succeed)
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    
+    # Robustly handle NaNs and zero-variance columns after conversion
     for col in results_df.select_dtypes(include=np.number).columns:
         if results_df[col].isna().all():
             results_df[col] = 0.0
         else:
             median_val = results_df[col].median()
             results_df[col] = results_df[col].fillna(median_val)
+        
+        # Add a tiny amount of noise to constant columns to avoid issues in later calculations
         if results_df[col].var() < 1e-8:
             results_df[col] += np.random.normal(0, 0.01, len(results_df))
     
