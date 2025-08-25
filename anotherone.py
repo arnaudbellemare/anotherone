@@ -344,8 +344,15 @@ METRIC_NAME_MAP = {**BASE_METRIC_NAME_MAP, **INSTITUTIONAL_METRIC_NAME_MAP}
 # REVERSE_METRIC_NAME_MAP = {v: k for k, v in METRIC_NAME_MAP.items()} # Not strictly needed for this function, but useful for general mapping.
 REVERSE_METRIC_NAME_MAP = {v: k for k, v in METRIC_NAME_MAP.items()}
 
-# --- Define the full list of columns for the DataFrame ---
 columns = BASE_FACTORS + INSTITUTIONAL_FACTORS
+
+# --- PLACE THE NEW CODE HERE ---
+all_metric_names = list(METRIC_NAME_MAP.values())
+num_metrics = len(all_metric_names)
+default_weights = {
+    metric_name: 100.0 / num_metrics for metric_name in all_metric_names
+} if num_metrics > 0 else {}
+# --- END OF NEW CODE ---
 
 
 def get_pretty_factor_name(factor_name: str) -> str:
