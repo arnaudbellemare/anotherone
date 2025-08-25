@@ -17,6 +17,7 @@ arviz
 networkx 
 amplpy
 cvxpy
+requests-cache
 # --- Scientific & Stats ---
 scipy
 statsmodels
