@@ -532,7 +532,7 @@ def display_macro_regime_analysis():
             st.error("No valid S&P 500 data for analysis. Please check '^GSPC' ticker or date range.")
             return
 
-        rt_sp500 = calculate_returns(sp500_daily_full_data)
+        rt_sp500 = calculate_returns_cached(sp500_daily_full_data)
         
         if rt_sp500 is None or rt_sp500.empty:
             st.error("No valid S&P 500 returns data for analysis.")
