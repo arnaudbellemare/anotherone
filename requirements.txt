@@ -1,0 +1,51 @@
+# --- Core App & Data ---
+streamlit
+streamlit-autorefresh
+pandas_datareader 
+tqdm
+plotnine
+numba
+pandas
+numpy
+yfinance
+plotly
+altair
+xgboost
+PyWavelets
+pymc
+arviz
+networkx 
+amplpy
+cvxpy
+# --- Scientific & Stats ---
+scipy
+statsmodels
+scikit-learn
+py_vollib
+fastdtw
+python-dateutil
+aiohttp
+aiodns
+pandas_datareader
+darts
+# --- ML & Plotting ---
+matplotlib
+seaborn
+rich
+#4
+requests 
+ccxt
+
+toolz
+matplotlib
+minisom
+retrying
+tenacity
+
+arch 
+hmmlearn
+# --- next ---
+arch
+geomstats
+mpi4py
+joblib 
