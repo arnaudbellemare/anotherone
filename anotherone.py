@@ -2183,27 +2183,26 @@ def calculate_relative_carry(results_df):
     Calculates the relative carry for each stock against its sector median.
     Rx_t = Cx_t - median(C_sector_t)
     """
-    if 'Carry' not in results_df.columns or 'Sector' not in results_df.columns: # Added robustness check
+    # --- FIX: Add .copy() to de-fragment the DataFrame ---
+    results_df = results_df.copy()
+    
+    if 'Carry' not in results_df.columns or 'Sector' not in results_df.columns:
         st.warning("Cannot calculate Relative Carry: Missing 'Carry' or 'Sector' column. Setting to 0.0")
         results_df['Relative_Carry'] = 0.0
         return results_df
 
     # Calculate the median carry for each sector
-    # Ensure 'Carry' column is numeric and handle NaNs gracefully
-    results_df['Carry_Numeric'] = pd.to_numeric(results_df['Carry'], errors='coerce') # Added explicit numeric conversion
+    results_df['Carry_Numeric'] = pd.to_numeric(results_df['Carry'], errors='coerce')
     
-    if results_df['Carry_Numeric'].isnull().all(): # Added check for all NaN carry
+    if results_df['Carry_Numeric'].isnull().all():
         st.warning("All 'Carry' values are NaN. Cannot calculate Relative Carry. Setting to 0.0")
         results_df['Relative_Carry'] = 0.0
         return results_df
 
-    # Group by sector and transform to get the median for each stock's sector
     sector_median_carry = results_df.groupby('Sector')['Carry_Numeric'].transform('median')
     
-    # The final signal is the stock's carry minus its sector's median carry
     results_df['Relative_Carry'] = results_df['Carry_Numeric'] - sector_median_carry
     
-    # Clean up the temporary column
     results_df = results_df.drop(columns=['Carry_Numeric'])
 
     return results_df
@@ -2232,31 +2231,33 @@ def analyze_coefficient_stability(historical_data):
     if not historical_data:
         return pd.DataFrame()
 
-    # Ensure all series in historical_data have the same index for concatenation
-    # Reindex all to the union of all indices or a common, filtered set
     all_indices = pd.Index([])
     for s in historical_data:
         all_indices = all_indices.union(s.index)
     
-    # Pad shorter series with NaN if their factor was not present at that time
     df = pd.concat([s.reindex(all_indices) for s in historical_data], axis=1)
     df.columns = [f'run_{i}' for i in range(len(df.columns))]
     
     stability_metrics = pd.DataFrame(index=df.index)
-    stability_metrics['mean_coeff'] = df.mean(axis=1)
-    stability_metrics['std_coeff'] = df.std(axis=1)
     
-    # Handle std_coeff being zero to prevent division by zero in Sharpe
-    stability_metrics['sharpe_ratio_coeff'] = stability_metrics['mean_coeff'] / (stability_metrics['std_coeff'].replace(0, np.nan)) # Replaced +1e-6 with replace(0,np.nan)
+    # --- FIX: Safely calculate mean and std to avoid RuntimeWarning ---
+    # Calculate count of non-NaN values for each factor (row)
+    non_nan_counts = df.count(axis=1)
+
+    # Calculate mean only for rows with at least one valid value
+    stability_metrics['mean_coeff'] = df.mean(axis=1, skipna=True)
+    stability_metrics['std_coeff'] = df.std(axis=1, skipna=True)
     
-    # For pct_positive, we need to handle NaNs correctly. Use .count() as total, not len(df.columns)
-    # as some factors might not be present in all runs.
-    stability_metrics['pct_positive'] = (df > 0).sum(axis=1) / df.count(axis=1).replace(0, np.nan) # Used df.count(axis=1).replace(0, np.nan)
-    stability_metrics['pct_positive'].fillna(0, inplace=True) # Fill NaNs (e.g. if factor was never present)
+    # Handle cases where a factor was never present or std is zero
+    stability_metrics.loc[non_nan_counts == 0, ['mean_coeff', 'std_coeff']] = 0.0
+    
+    stability_metrics['sharpe_ratio_coeff'] = stability_metrics['mean_coeff'] / stability_metrics['std_coeff'].replace(0, np.nan)
+    
+    # Calculate percentage positive safely
+    positive_counts = (df > 0).sum(axis=1)
+    stability_metrics['pct_positive'] = (positive_counts / non_nan_counts.replace(0, np.nan)).fillna(0)
 
-    # Sort by absolute Sharpe to find most robust factors (positive or negative)
-    return stability_metrics.sort_values(by='sharpe_ratio_coeff', key=abs, ascending=False).fillna(0) # Fill NaNs after sorting for display
-
+    return stability_metrics.sort_values(by='sharpe_ratio_coeff', key=abs, ascending=False).fillna(0)
 def set_weights_from_stability(stability_df, all_metrics, reverse_metric_map):
     """
     Sets final portfolio weights based on the factor's stability (Coefficient Sharpe Ratio).
@@ -3777,11 +3778,13 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, 
         data['Name'] = f"{ticker_symbol} (Processing Error)"
         return [data.get(col) for col in columns], pd.Series(dtype=float)
 # REPLACE your existing process_tickers function with this one.
+# REPLACE your existing process_tickers function with this one
+
 @st.cache_data
 def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     results, returns_dict, failed_tickers = [], {}, []
     
-    # Step 1: Pre-fetch all data in parallel
+    # Step 1: Pre-fetch all data in parallel (This part is already correct)
     all_ticker_data = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_fetch = {executor.submit(fetch_ticker_data, ticker): ticker for ticker in _tickers}
@@ -3791,12 +3794,17 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
                 all_ticker_data[ticker_symbol] = future.result()
             except Exception as e:
                 logging.error(f"Failed to fetch initial data for {ticker_symbol}: {e}")
+                failed_tickers.append(ticker_symbol)
                 all_ticker_data[ticker_symbol] = (None, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
     # Step 2: Process each ticker using the pre-fetched data in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_process = {}
         for ticker_symbol in _tickers:
+            # Skip tickers that already failed during the fetch stage
+            if ticker_symbol in failed_tickers:
+                continue
+            
             (ticker_obj, history, info, financials, balancesheet, cashflow, 
              q_financials, q_balancesheet, q_cashflow) = all_ticker_data[ticker_symbol]
             
@@ -3808,15 +3816,15 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
             )
             future_to_process[future] = ticker_symbol
 
-        for future in tqdm(as_completed(future_to_process), total=len(_tickers), desc="Processing All Ticker Metrics"):
+        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing All Ticker Metrics"):
             ticker = future_to_process[future]
             try:
-                result_metrics_list, log_returns_series = future.result()
-                results.append(result_metrics_list)
+                # --- FIX: Receive a dictionary, not a list ---
+                result_metrics_dict, log_returns_series = future.result()
+                results.append(result_metrics_dict) # Append the dictionary
                 if log_returns_series is not None and not log_returns_series.empty:
                     returns_dict[ticker] = log_returns_series
-                else:
-                    failed_tickers.append(ticker)
+                # No need to add to failed_tickers here unless the future itself raises an exception
             except Exception as e:
                 logging.error(f"Failed to process {ticker} in future: {e}")
                 failed_tickers.append(ticker)
@@ -3824,9 +3832,13 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     if not results:
         return pd.DataFrame(columns=columns), failed_tickers, {}
     
-    results_df = pd.DataFrame(results, columns=columns)
+    # --- FIX: Let pandas create the DataFrame from a list of dictionaries. It will align columns automatically. ---
+    results_df = pd.DataFrame(results)
     
-    # Post-processing (this part will now succeed)
+    # Ensure all columns from the global 'columns' list are present, adding any missing ones with NaN
+    results_df = results_df.reindex(columns=columns)
+
+    # Post-processing (this part remains the same and is now safer)
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     
@@ -5025,20 +5037,24 @@ def main():
     )
 
     # --- Data Fetching and Initial Processing ---
+    # --- Data Fetching and Initial Processing ---
     with st.spinner("Fetching ETF and Macroeconomic histories..."):
         etf_histories = fetch_all_etf_histories(etf_list)
-        macro_data = fetch_macro_data() # Fetch macro data, but it won't be used for weight adjustments now
+        macro_data = fetch_macro_data()
     st.success("All historical data loaded.")
 
     with st.spinner(f"Processing {len(tickers)} tickers..."):
         results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
 
+    # --- FIX: Add a robustness check to stop the app if data processing fails ---
     if results_df.empty:
-        st.error("Fatal Error: No tickers could be processed."); st.stop()
+        st.error("Fatal Error: No tickers could be processed. This may be due to network issues or problems with the data source (yfinance). Please try again later or check the logs.")
+        st.stop()  # Stop the script execution immediately
+
     st.success(f"Successfully processed {len(results_df)} tickers.")
     if failed_tickers:
         st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
-
+        
     # --- CORRECTED ORDER OF OPERATIONS ---
     # 1. First, we must clean the raw returns.
     with st.spinner("Applying Winsorization to clean return data..."):
