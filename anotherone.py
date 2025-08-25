@@ -3838,6 +3838,8 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, 
 
 # --- REPLACE your ENTIRE existing process_tickers function with this one ---
 
+# --- PASTE THIS ENTIRE, CORRECT FUNCTION INTO YOUR SCRIPT ---
+
 @st.cache_data
 def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
     """
@@ -3850,7 +3852,11 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
     all_other_data = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         def fetch_non_history_data(ticker_symbol):
-            ticker = yf.Ticker(ticker_symbol)
+            # Using a robust session can help with reliability here too.
+            session = requests_cache.CachedSession('yfinance.cache')
+            session.headers['User-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            ticker = yf.Ticker(ticker_symbol, session=session)
+            
             # We don't call .history() here anymore.
             return (ticker, ticker.info, ticker.financials, ticker.balance_sheet, ticker.cashflow, 
                     ticker.quarterly_financials, ticker.quarterly_balance_sheet, ticker.quarterly_cashflow)
@@ -3872,14 +3878,10 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
             if ticker_symbol in failed_tickers or ticker_symbol not in _all_histories:
                 continue
 
-            # Get the pre-fetched history for this ticker from the _all_histories dictionary
             history = _all_histories[ticker_symbol]
-            
-            # Get the other financial data fetched above
             (ticker_obj, info, financials, balancesheet, cashflow,
              q_financials, q_balancesheet, q_cashflow) = all_other_data[ticker_symbol]
             
-            # Submit to the processing pool
             future = executor.submit(
                 process_single_ticker,
                 ticker_symbol, _etf_histories, _sector_etf_map,
@@ -3892,7 +3894,7 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
             ticker = future_to_process[future]
             try:
                 result_metrics_dict, log_returns_series = future.result()
-                results.append(result_metrics_dict) # Append the dictionary
+                results.append(result_metrics_dict)
                 if log_returns_series is not None and not log_returns_series.empty:
                     returns_dict[ticker] = log_returns_series
             except Exception as e:
@@ -3902,11 +3904,10 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
     if not results:
         return pd.DataFrame(columns=columns), failed_tickers, {}
     
-    # Let pandas create the DataFrame from a list of dictionaries.
     results_df = pd.DataFrame(results)
-    results_df = results_df.reindex(columns=columns) # Ensure all columns are present
+    results_df = results_df.reindex(columns=columns)
 
-    # Post-processing (this part remains the same)
+    # Post-processing (remains the same)
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     
