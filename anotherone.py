@@ -64,12 +64,12 @@ INSTITUTIONAL_FACTORS = [
     'IndRel_CACL', 'WCA', 'WCA_2', '5YRel_GPMargin', '5YRel_WCTurn', 'FinLev', 'LogAssets',
     '5YRel_PTMargin', '5YRel_FCFP', '5YRel_OPM', 'Chg1YLTDA', 'IndRel_TotalAccruals', 'CACL',
     'CFIC', 'EstDiffC', 'EBITMargin', 'IndRel_DepToCapex', '5YRel_EBITMargin', 'IndRel_WCTurn',
-    'ROE', 'IndRel_WCA', 'CashAst', 'AstAdjChg3YFCF', 'EPSEstDispFY1C', 'DepToCapex',
+    'IndRel_WCA', 'CashAst', 'AstAdjChg3YFCF', 'EPSEstDispFY1C', 'DepToCapex',
     'IndRel_ROE', 'IndRel_DebtChg1Y', 'Chg3YFCF', '5YRel_ROE', '5YRel_ROIC', '5YRel_CashAst',
     'CFAst', 'PAdjChg3YFCF', 'AdjEPSNumRevFY1C', 'IndRel_InvToAst', 'IndRel_CashAst',
     'IndRel_ROA', 'IndRel_OEA', 'CashRatio', 'IndRel_NetProfitMargin', 'AstAdjChg3YOCF',
-    'AstAdjChg1YFCF', 'IndRel_ROIC', 'IndRel_ChgDeprCapex', 'IndRel_CapAcqRatio', 'ROIC',
-    'IndRel_FCFEV', 'IndRel_FCFP', 'IndRel_GPMargin', 'ROA', 'OEA', 'AdjEPSNumRevFY2C',
+    'AstAdjChg1YFCF', 'IndRel_ROIC', 'IndRel_ChgDeprCapex', 'IndRel_CapAcqRatio',
+    'IndRel_FCFEV', 'IndRel_FCFP', 'IndRel_GPMargin', 'OEA', 'AdjEPSNumRevFY2C',
     'PAdjChg3YEPS', 'MVEToTL', 'IndRel_WCapToSales', 'SolvencyRatio', 'ROA_2', 'AstAdjChg1YOCF',
     'IndRel_CapExToAst', 'IndRel_PAdjChg1YFCF', 'CFEqt', 'Chg3YAstTo', 'IndRel_PTMargin',
     'IndRel_Chg1YOPM', 'IndRel_RecTurn', 'AstAdjChg1YCF', '5YRel_Chg1YEPS', 'EbitToAst_2',
@@ -1674,17 +1674,24 @@ def calculate_garch_volatility(returns, window=252, dist='t'):
 def calculate_returns_cached(ticker, periods_tuple):
     periods = list(periods_tuple)
     try:
+        # We need a longer period to ensure we can calculate 252-day returns,
+        # but also sufficient for shorter periods. "2y" is a good balance.
         history = yf.Ticker(ticker).history(period="5y", auto_adjust=True)
-        if history.empty or len(history) < max(p for p in periods if p is not None): return {f"Return_{p}d": np.nan for p in periods}
+        if history.empty or len(history) < max(p for p in periods if p is not None):
+            return {f"Return_{p}d": np.nan for p in periods}
+        
         returns = {}
         for period in periods:
-            if len(history) > period:
+            if period is not None and len(history) > period:
+                # Calculate simple percentage return (current / past - 1)
                 returns[f"Return_{period}d"] = (history['Close'].iloc[-1] / history['Close'].iloc[-(period+1)] - 1) * 100
             else:
+                # BUG FIX: The colon after the key was causing a TypeError
                 returns[f"Return_{period}d"] = np.nan
         return returns
-    except Exception: return {f"Return_{p}d": np.nan for p in periods}
-
+    except Exception as e:
+        logging.error(f"Error calculating returns for {ticker} for periods {periods_tuple}: {e}")
+        return {f"Return_{p}d": np.nan for p in periods}
 def calculate_log_log_utility(returns):
     if returns.empty or returns.isna().all(): return np.nan
     try:
@@ -3747,20 +3754,20 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, 
 
         # --- Final Data Preparation ---
         # Correctly generate log_returns
+       # --- Final Data Preparation ---
         log_returns = pd.Series(dtype=float)
         if not history.empty and 'Close' in history.columns and not history['Close'].isnull().all():
             close_prices = history['Close'].dropna()
             if len(close_prices) > 1:
                  log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
 
-        # BUG FIX: The original code had `return result_list, ...` which is a NameError.
-        # This returns the data as a list in the correct order defined by the global `columns` variable.
+        # BUG FIX: Correctly return a list of values ordered by the global 'columns' list.
+        # This replaces the line `return result_list, log_returns` which caused a NameError.
         return [data.get(col) for col in columns], log_returns
 
     except Exception as e:
         logging.error(f"Critical error processing {ticker_symbol}: {e}", exc_info=True)
         data['Name'] = f"{ticker_symbol} (Processing Error)"
-        # Ensure a consistently shaped list is returned even on error
         return [data.get(col) for col in columns], pd.Series(dtype=float)
 # REPLACE your existing process_tickers function with this one.
 @st.cache_data
@@ -3774,22 +3781,18 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
         for future in tqdm(as_completed(future_to_fetch), total=len(_tickers), desc="Fetching All Ticker Data"):
             ticker_symbol = future_to_fetch[future]
             try:
-                # Store the tuple of fetched data
                 all_ticker_data[ticker_symbol] = future.result()
             except Exception as e:
                 logging.error(f"Failed to fetch initial data for {ticker_symbol}: {e}")
-                # Store a placeholder for failed fetches
                 all_ticker_data[ticker_symbol] = (None, pd.DataFrame(), {}, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame())
 
     # Step 2: Process each ticker using the pre-fetched data in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_process = {}
         for ticker_symbol in _tickers:
-            # Unpack the pre-fetched data tuple for the current ticker
-            (ticker_obj, history, info, financials, balancesheet, 
-             cashflow, q_financials, q_balancesheet, q_cashflow) = all_ticker_data[ticker_symbol]
+            (ticker_obj, history, info, financials, balancesheet, cashflow, 
+             q_financials, q_balancesheet, q_cashflow) = all_ticker_data[ticker_symbol]
             
-            # Submit the processing task, passing the fetched data as arguments
             future = executor.submit(
                 process_single_ticker, 
                 ticker_symbol, _etf_histories, _sector_etf_map, 
@@ -3801,7 +3804,6 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
         for future in tqdm(as_completed(future_to_process), total=len(_tickers), desc="Processing All Ticker Metrics"):
             ticker = future_to_process[future]
             try:
-                # The corrected process_single_ticker returns a list of metrics and a series of returns
                 result_metrics_list, log_returns_series = future.result()
                 results.append(result_metrics_list)
                 if log_returns_series is not None and not log_returns_series.empty:
@@ -3813,25 +3815,20 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
                 failed_tickers.append(ticker)
             
     if not results:
-        # If no tickers were successfully processed, return an empty DataFrame
         return pd.DataFrame(columns=columns), failed_tickers, {}
     
-    # Create the DataFrame from the consistently structured list of lists
     results_df = pd.DataFrame(results, columns=columns)
     
     # Post-processing (this part will now succeed)
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
     
-    # Robustly handle NaNs and zero-variance columns after conversion
     for col in results_df.select_dtypes(include=np.number).columns:
         if results_df[col].isna().all():
             results_df[col] = 0.0
         else:
             median_val = results_df[col].median()
             results_df[col] = results_df[col].fillna(median_val)
-        
-        # Add a tiny amount of noise to constant columns to avoid issues in later calculations
         if results_df[col].var() < 1e-8:
             results_df[col] += np.random.normal(0, 0.01, len(results_df))
     
