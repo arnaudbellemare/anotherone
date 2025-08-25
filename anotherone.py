@@ -33,6 +33,7 @@ from sklearn.linear_model import LinearRegression, Ridge # Ensure these are impo
 from functools import lru_cache # For caching calculate_returns_cached
 from sklearn.metrics import mean_absolute_error
 from plotly.subplots import make_subplots
+import requests_cache
 # --- Basic Configuration ---
 logging.basicConfig(filename='stock_analysis.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 st.set_page_config(page_title="Quantitative Portfolio Analysis", layout="wide")
