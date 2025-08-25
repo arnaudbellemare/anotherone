@@ -1296,8 +1296,24 @@ def fetch_all_etf_histories(_etf_list, period="3y"):
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_ticker_data(ticker_symbol):
-    ticker = yf.Ticker(ticker_symbol)
-    history = ticker.history(period="5y", auto_adjust=True, interval="1d").tz_localize(None)
+    """
+    Fetches ticker data using a cached session with a browser user-agent to improve reliability.
+    """
+    # Use a cached session to avoid re-downloading and reduce rate-limiting issues.
+    # This creates a 'yfinance.cache' file in your directory.
+    session = requests_cache.CachedSession('yfinance.cache')
+    session.headers['User-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    
+    ticker = yf.Ticker(ticker_symbol, session=session) # Pass the robust session to yfinance
+    
+    # Fetch data with a longer period initially to ensure enough data for all calculations
+    history = ticker.history(period="7y", auto_adjust=True, interval="1d").tz_localize(None)
+    
+    # --- CRITICAL ROBUSTNESS CHECK ---
+    # If history is too short after a successful download, something is wrong.
+    if history.empty or len(history) < 252: # Require at least 1 year of data to be considered valid
+        raise IOError(f"Insufficient historical data for {ticker_symbol}. Received {len(history)} rows.")
+
     info = ticker.info
     financials = ticker.financials
     balancesheet = ticker.balance_sheet
@@ -1305,8 +1321,8 @@ def fetch_ticker_data(ticker_symbol):
     quarterly_financials = ticker.quarterly_financials
     quarterly_balancesheet = ticker.quarterly_balance_sheet
     quarterly_cashflow = ticker.quarterly_cashflow
+    
     return ticker, history, info, financials, balancesheet, cashflow, quarterly_financials, quarterly_balancesheet, quarterly_cashflow
-
 # --- Quantitative Functions ---
 
 def calculate_mahalanobis_metrics(returns, cov_matrix, periods=252):
@@ -3763,20 +3779,21 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, 
         # --- Final Data Preparation ---
         # Correctly generate log_returns
        # --- Final Data Preparation ---
+        # --- Final Data Preparation ---
         log_returns = pd.Series(dtype=float)
         if not history.empty and 'Close' in history.columns and not history['Close'].isnull().all():
             close_prices = history['Close'].dropna()
             if len(close_prices) > 1:
                  log_returns = np.log(close_prices / close_prices.shift(1)).dropna()
 
-        # BUG FIX: Correctly return a list of values ordered by the global 'columns' list.
-        # This replaces the line `return result_list, log_returns` which caused a NameError.
-        return [data.get(col) for col in columns], log_returns
+        # --- FIX: RETURN THE DICTIONARY, NOT A LIST ---
+        return data, log_returns
 
     except Exception as e:
         logging.error(f"Critical error processing {ticker_symbol}: {e}", exc_info=True)
         data['Name'] = f"{ticker_symbol} (Processing Error)"
-        return [data.get(col) for col in columns], pd.Series(dtype=float)
+        # --- FIX: RETURN THE DICTIONARY ON ERROR TOO ---
+        return data, pd.Series(dtype=float)
 # REPLACE your existing process_tickers function with this one.
 # REPLACE your existing process_tickers function with this one
 
@@ -3799,34 +3816,27 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
 
     # Step 2: Process each ticker using the pre-fetched data in parallel
     with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_process = {}
-        for ticker_symbol in _tickers:
-            # Skip tickers that already failed during the fetch stage
-            if ticker_symbol in failed_tickers:
-                continue
-            
-            (ticker_obj, history, info, financials, balancesheet, cashflow, 
-             q_financials, q_balancesheet, q_cashflow) = all_ticker_data[ticker_symbol]
-            
-            future = executor.submit(
-                process_single_ticker, 
-                ticker_symbol, _etf_histories, _sector_etf_map, 
-                ticker_obj, history, info, financials, balancesheet, cashflow, 
-                q_financials, q_balancesheet, q_cashflow
-            )
-            future_to_process[future] = ticker_symbol
+        future_to_process = {
+            executor.submit(
+                process_single_ticker,
+                ticker_symbol, _etf_histories, _sector_etf_map,
+                *all_other_data[ticker_symbol][:1], # ticker_obj
+                _all_histories[ticker_symbol],     # THE GOOD HISTORY
+                *all_other_data[ticker_symbol][1:]  # the rest of the data
+            ): ticker_symbol
+            for ticker_symbol in _tickers if ticker_symbol not in failed_tickers and ticker_symbol in _all_histories
+        }
 
-        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing All Ticker Metrics"):
+        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing Metrics"):
             ticker = future_to_process[future]
             try:
-                # --- FIX: Receive a dictionary, not a list ---
+                # IMPORTANT: We are now using the DICTIONARY-based return
                 result_metrics_dict, log_returns_series = future.result()
-                results.append(result_metrics_dict) # Append the dictionary
-                if log_returns_series is not None and not log_returns_series.empty:
+                results.append(result_metrics_dict)
+                if not log_returns_series.empty:
                     returns_dict[ticker] = log_returns_series
-                # No need to add to failed_tickers here unless the future itself raises an exception
             except Exception as e:
-                logging.error(f"Failed to process {ticker} in future: {e}")
+                logging.error(f"Failed to process {ticker}: {e}")
                 failed_tickers.append(ticker)
             
     if not results:
@@ -5036,27 +5046,51 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-    # --- Data Fetching and Initial Processing ---
-    # --- Data Fetching and Initial Processing ---
     with st.spinner("Fetching ETF and Macroeconomic histories..."):
         etf_histories = fetch_all_etf_histories(etf_list)
         macro_data = fetch_macro_data()
     st.success("All historical data loaded.")
 
-    with st.spinner(f"Processing {len(tickers)} tickers..."):
-        results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
+    # Step 1: Robustly fetch all price histories FIRST using the reliable bulk download method.
+    # This is the most important new function.
+    with st.spinner(f"Robustly fetching historical prices for {len(tickers)} tickers..."):
+        all_histories = fetch_all_histories_robustly(tickers)
 
-    # --- FIX: Add a robustness check to stop the app if data processing fails ---
+    # Step 2: Check if the robust fetch actually worked. If not, stop the app with a clear error.
+    if not all_histories:
+        st.error(
+            "FATAL: Historical price data could not be retrieved for ANY ticker using the robust method. "
+            "Cannot continue. Please check your network connection or ticker list."
+        )
+        st.stop()
+
+    # Step 3: Pass the GOOD, pre-fetched data to the processing function.
+    # We only process tickers for which we successfully got a valid history.
+    with st.spinner(f"Processing {len(all_histories)} tickers with valid history..."):
+        valid_tickers = list(all_histories.keys())
+        results_df, failed_tickers, returns_dict = process_tickers(
+            valid_tickers, etf_histories, sector_etf_map, all_histories
+        )
+
+    # Step 4: Validate the results from process_tickers.
     if results_df.empty:
-        st.error("Fatal Error: No tickers could be processed. This may be due to network issues or problems with the data source (yfinance). Please try again later or check the logs.")
-        st.stop()  # Stop the script execution immediately
+        st.error("Fatal Error: No tickers could be processed even with valid history. Check the process_single_ticker function for calculation errors.")
+        st.stop()
 
     st.success(f"Successfully processed {len(results_df)} tickers.")
     if failed_tickers:
-        st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
-        
-    # --- CORRECTED ORDER OF OPERATIONS ---
-    # 1. First, we must clean the raw returns.
+        st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed during financial data fetching: {', '.join(failed_tickers)}")
+
+    # Step 5: CRITICAL - Validate that the returns_dict was successfully created.
+    if not returns_dict:
+        st.error(
+            "FATAL: The 'returns_dict' is empty. This means that even with valid historical data, "
+            "the log return calculation failed for all tickers inside 'process_single_ticker'. "
+            "Please check the logic for calculating log_returns."
+        )
+        st.stop()
+
+    # --- NOW, the rest of your code is guaranteed to work ---
     with st.spinner("Applying Winsorization to clean return data..."):
         winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
     st.success("Return data cleaned successfully.")
