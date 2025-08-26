@@ -5087,45 +5087,36 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-    # --- NEW, ROBUST DATA FETCHING WORKFLOW ---
-    with st.spinner("Fetching ETF and Macroeconomic histories..."):
-        etf_histories = fetch_all_etf_histories(etf_list)
-        macro_data = fetch_macro_data()
-    st.success("ETF and Macro data loaded.")
+# --- Data Fetching and Initial Processing (Simplified & Corrected) ---
+with st.spinner("Fetching ETF and Macroeconomic histories..."):
+    etf_histories = fetch_all_etf_histories(etf_list)
+    macro_data = fetch_macro_data()
+st.success("ETF and Macro data loaded.")
 
-    # Step 1: Robustly fetch all price histories first.
-    with st.spinner(f"Robustly fetching historical prices for {len(tickers)} tickers..."):
-        all_histories = fetch_all_histories_robustly(tickers)
+# This is the simpler, original way to process tickers. It's more reliable for debugging.
+with st.spinner(f"Processing {len(tickers)} tickers..."):
+    # The call now only takes 3 arguments, as it should for this logic.
+    results_df, failed_tickers, returns_dict = process_tickers(
+        tickers, etf_histories, sector_etf_map
+    )
 
-    # Step 2: Check if the robust fetch worked.
-    if not all_histories:
-        st.error("FATAL: Historical price data could not be retrieved. Cannot continue.")
-        st.stop()
+# Step 4: Validate results (this part remains the same).
+if results_df.empty:
+    st.error("Fatal Error: No tickers could be processed.")
+    st.stop()
 
-    # Step 3: Pass the good, pre-fetched data to the processing function.
-    with st.spinner(f"Processing {len(all_histories)} tickers with valid history..."):
-        valid_tickers = list(all_histories.keys())
-        results_df, failed_tickers, returns_dict = process_tickers(
-            valid_tickers, etf_histories, sector_etf_map, all_histories
-        )
+st.success(f"Successfully processed {len(results_df)} tickers.")
+if failed_tickers:
+    st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
+    
+if not returns_dict:
+    st.error("FATAL: The 'returns_dict' is empty. Log return calculation failed for all tickers.")
+    st.stop()
 
-    # Step 4: Validate results.
-    if results_df.empty:
-        st.error("Fatal Error: No tickers could be processed.")
-        st.stop()
-
-    st.success(f"Successfully processed {len(results_df)} tickers.")
-    if failed_tickers:
-        st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
-        
-    if not returns_dict:
-        st.error("FATAL: The 'returns_dict' is empty. Log return calculation failed for all tickers.")
-        st.stop()
-
-    # --- Winsorization and the rest of your app logic ---
-    with st.spinner("Applying Winsorization to clean return data..."):
-        winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
-    st.success("Return data cleaned successfully.")
+# --- Winsorization and the rest of your app logic ---
+with st.spinner("Applying Winsorization to clean return data..."):
+    winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
+st.success("Return data cleaned successfully.")
 
     # 2. Now, with clean returns, we can generate advanced signals.
     with st.spinner("Generating advanced signals (Carry, Mean Reversion)..."):
