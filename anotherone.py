@@ -5733,5 +5733,61 @@ def main():
             st.dataframe(results_df, use_container_width=True)
         else:
             st.info("No processed data available.")
+def debug_process_tickers():
+    """
+    A single-threaded, verbose version of process_tickers to find the hidden error.
+    """
+    print("--- RUNNING VERBOSE DEBUGGER ---")
+    
+    # Use a small, diverse list of tickers for testing
+    debug_tickers = ["MSFT", "GOOG", "JNJ"] 
+    
+    print("Fetching dummy ETF data for the test...")
+    try:
+        etf_histories = {'SPY': yf.Ticker('SPY').history(period="3y")}
+        print("...Dummy ETF data fetched successfully.")
+    except Exception as e:
+        print(f"!!! CRITICAL: Could not fetch even basic ETF data. Check yfinance or network. Error: {e}")
+        return
+
+    returns_dict = {}
+    failed_tickers = []
+
+    print("\n>>> Processing tickers one-by-one to expose the error...")
+    for ticker in debug_tickers:
+        print(f"\n----------------------------------")
+        print(f"--- Attempting to process: {ticker} ---")
+        print(f"----------------------------------")
+        try:
+            # This directly calls the function we need to inspect
+            # The 'except' block here will catch the real error
+            result_list, log_returns = process_single_ticker(ticker, etf_histories, sector_etf_map)
+            
+            if log_returns is not None and not log_returns.empty:
+                print(f"✅ SUCCESS for {ticker}. Log returns were generated.")
+                returns_dict[ticker] = log_returns
+            else:
+                print(f"⚠️  WARNING for {ticker}: The function completed but returned an EMPTY log_returns series.")
+                failed_tickers.append(ticker)
+
+        except Exception as e:
+            # THIS IS THE MOST IMPORTANT PART. IT WILL PRINT THE REAL ERROR.
+            print(f"💥💥💥 FATAL ERROR for {ticker}: The function crashed with an unhandled exception. THIS IS THE ROOT CAUSE. 💥💥💥")
+            import traceback
+            traceback.print_exc() # This prints the full error, including the exact line number.
+            failed_tickers.append(ticker)
+
+    print("\n====================")
+    print("--- DEBUG SUMMARY ---")
+    print(f"Successfully processed: {list(returns_dict.keys())}")
+    print(f"Failed to process: {failed_tickers}")
+    if not returns_dict:
+        print("\n>>> CONCLUSION: The 'returns_dict' is empty. The traceback printed above for the first failed ticker is the problem you need to solve.")
+    else:
+        print("\n>>> CONCLUSION: Some tickers succeeded. The error is likely specific to the data of the failed tickers.")
+
+# --- This runs our debugger instead of the Streamlit app ---
 if __name__ == "__main__":
-    main()
+    debug_process_tickers()
+#if __name__ == "__main__":
+    #main()
