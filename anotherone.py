@@ -2060,7 +2060,7 @@ def calculate_relative_carry(results_df):
 def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'):
     """
     Generates a REAL history of pure factor returns by iterating backward in time.
-    (CORRECTED to handle timezone issues and use a more robust indexer)
+    (CORRECTED to handle the join/merge error)
     """
     logging.info(f"Starting REAL historical pure returns generation for {steps} steps...")
     if not _returns_dict:
@@ -2069,20 +2069,26 @@ def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horiz
 
     # Create a single DataFrame from the returns dictionary
     returns_df = pd.DataFrame(_returns_dict)
-
-    # --- FIX START: Ensure index is sorted and timezone-naive ---
+    
+    # Ensure index is sorted and timezone-naive
     if not returns_df.index.is_monotonic_increasing:
         returns_df.sort_index(inplace=True)
     if returns_df.index.tz is not None:
         returns_df.index = returns_df.index.tz_localize(None)
-    # --- FIX END ---
 
     if returns_df.empty:
         logging.error("Historical returns DataFrame is empty after creation.")
         return {h: [] for h in time_horizons}
 
+    # --- FIX START: Set the index of results_df to 'Ticker' ONCE before the loop ---
+    if 'Ticker' in _results_df.columns:
+        results_df_indexed = _results_df.set_index('Ticker')
+    else:
+        logging.error("Cannot find 'Ticker' column in results_df for indexing.")
+        return {h: [] for h in time_horizons}
+    # --- FIX END ---
+        
     end_date = returns_df.index.max()
-    # Also ensure the date_range is timezone-naive (it is by default, but this is explicit)
     date_range = pd.date_range(end=end_date, periods=steps, freq=f'-1{freq}').tz_localize(None)
 
     historical_results_by_horizon = {h: [] for h in time_horizons}
@@ -2090,18 +2096,15 @@ def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horiz
     for analysis_date in tqdm(date_range, desc="Analyzing Historical Factor Performance"):
         for horizon_label, target_col in time_horizons.items():
             days_forward = int(target_col.split('_')[1][:-1])
-
-            # --- FIX START: Use robust get_indexer instead of get_loc ---
+            
             try:
-                # get_indexer is more robust for finding the nearest integer position
                 start_idx_loc_arr = returns_df.index.get_indexer([analysis_date], method='nearest')
-                if start_idx_loc_arr[0] == -1: # Indicates no valid location found
+                if start_idx_loc_arr[0] == -1:
                     continue
                 start_idx_loc = start_idx_loc_arr[0]
             except Exception as e:
                 logging.warning(f"Could not find index location for {analysis_date}: {e}. Skipping.")
                 continue
-            # --- FIX END ---
 
             end_idx_loc = min(start_idx_loc + days_forward, len(returns_df) - 1)
             
@@ -2114,8 +2117,12 @@ def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horiz
             forward_returns = returns_df.loc[start_date:end_date].sum()
             forward_returns_df = forward_returns.to_frame(name=target_col)
             
-            analysis_df = _results_df.join(forward_returns_df, on='Ticker')
-            analysis_df = analysis_df.dropna(subset=[target_col])
+            # --- FIX START: Use the indexed DataFrame and a standard index-based join ---
+            # This is cleaner and avoids the column overlap error.
+            analysis_df = results_df_indexed.join(forward_returns_df, how='inner')
+            # --- FIX END ---
+            
+            # We no longer need to dropna for the target_col because 'inner' join already handles it
             
             if analysis_df.empty or len(analysis_df) < 50:
                 continue
