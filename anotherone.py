@@ -2834,12 +2834,13 @@ def _calculate_slope(series, window):
     slope, _, _, _, _ = linregress(x, y)
     return slope
 
-def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map, ticker, history, info, financials, balancesheet, cashflow, quarterly_financials, quarterly_balancesheet, quarterly_cashflow):
+def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
     """
-    Processes a single ticker using PRE-FETCHED data.
+    Processes a single ticker by fetching its own data. Accepts 3 arguments.
     """
-    data = {col: np.nan for col in columns} # Initialize with all possible columns
-    data['Ticker'] = ticker_symbol
+    try:
+        # This version fetches its own data, which is less efficient but matches the old calling pattern.
+        ticker, history, info, financials, balancesheet, cashflow, quarterly_financials, quarterly_balancesheet, quarterly_cashflow = fetch_ticker_data(ticker_symbol)
 
     try:
         # DO NOT re-fetch data here. Use the data passed as arguments.
