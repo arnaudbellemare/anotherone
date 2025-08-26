@@ -2841,12 +2841,14 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
     try:
         # This version fetches its own data, which is less efficient but matches the old calling pattern.
         ticker, history, info, financials, balancesheet, cashflow, quarterly_financials, quarterly_balancesheet, quarterly_cashflow = fetch_ticker_data(ticker_symbol)
-
-    try:
-        # DO NOT re-fetch data here. Use the data passed as arguments.
+        
         if history.empty or not info:
-            data['Name'] = f"{ticker_symbol} (Failed to fetch history or info)"
-            return [data.get(col) for col in columns], pd.Series(dtype=float)
+            failed_data = {col: np.nan for col in columns}
+            failed_data['Ticker'] = ticker_symbol
+            failed_data['Name'] = f"{ticker_symbol} (Failed to fetch history or info)"
+            return [failed_data.get(col) for col in columns], pd.Series(dtype=float)
+        data = {col: np.nan for col in columns}
+        data['Ticker'] = ticker_symbol
         data['Name'] = info.get('longName', 'N/A')
         data['Sector'] = info.get('sector', 'Unknown')
         
