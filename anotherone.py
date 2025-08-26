@@ -146,7 +146,62 @@ REVERSE_METRIC_NAME_MAP = {v: k for k, v in METRIC_NAME_MAP.items()}
 ################################################################################
 # SECTION 1: ALL FUNCTION DEFINITIONS
 ################################################################################
+def display_theoretical_background():
+    """
+    Displays explanations of the quantitative concepts used in the application.
+    """
+    st.header("📜 Theoretical Background & Methodology")
+    st.info("This section explains the 'why' behind the quantitative techniques used in this tool to build a robust factor model. These concepts are drawn from institutional quantitative finance.")
 
+    st.subheader("Key Goal: Improving the Information Coefficient (IC)")
+    st.write("""
+    The **Information Coefficient (IC)** is the cornerstone of factor investing. It measures the correlation between a factor's prediction (e.g., ranking stocks by a 'Value' score) and the actual outcome (e.g., their future returns). A high and stable IC means the factor is a reliable predictor. The entire model is designed to find, weigh, and combine factors in a way that maximizes the portfolio's effective IC.
+    """)
+
+    # --- Accordion for detailed concepts ---
+    with st.expander("Enhancing Factor Signals (Transform & Combine)"):
+        st.markdown("#### Transform Factors")
+        st.markdown("""
+        *   **Concept:** Raw factor data (like Market Cap) can have extreme outliers that distort analysis. Applying transformations normalizes the data's distribution, ensuring that ranks capture meaningful differences rather than just noise from extreme values.
+        *   **Implementation (`calculate_pure_returns`):**
+            *   **Log Transformation:** For factors with large positive values (e.g., Market Cap), a `log1p` transform is applied to compress the scale.
+            *   **Robust Scaling:** Instead of a standard Z-score (which is sensitive to outliers), the `RobustScaler` is used. It centers data using the median and scales it using the interquartile range, making the transformation highly resistant to extreme data points.
+        """)
+
+        st.markdown("#### Combine Factors")
+        st.markdown("""
+        *   **Concept:** A single factor is rarely perfect. By creating a composite score from a weighted average of multiple factor *ranks*, we build a more stable and consistent signal. This diversification at the factor level often improves the overall model's IC.
+        *   **Implementation (Scoring block in `main`):** The final `Score` for each stock is not based on a single metric. It's a weighted sum of its percentile ranks across all the factors chosen by the stability analysis. This creates a robust, multi-faceted composite alpha factor.
+        """)
+
+    with st.expander("Isolating Pure Alpha (Factor Classification)"):
+        st.markdown("#### Neutralize Exposures to Isolate Pure Signals")
+        st.markdown("""
+        *   **Concept:** A simple factor is often contaminated by other unintended exposures. For example, a "Value" factor might be heavily biased towards financial stocks. Is the factor working because value is being rewarded, or simply because financials are having a good run? To find out, we must neutralize these exposures.
+        *   **Implementation (`calculate_pure_returns`):** This is one ofthe most critical steps. By running a cross-sectional multiple regression of stock returns against *all* factors simultaneously, the model calculates each factor's **pure return**. The regression coefficient for "Value" represents its contribution to returns *after controlling for the effects of sector, size, momentum, and all other factors in the model*. This isolates the true, pure alpha signal of each factor.
+        """)
+
+        st.markdown("#### Dynamic Classification & Weighting")
+        st.markdown("""
+        *   **Concept:** Not all factors work well in all market conditions. A truly robust model must dynamically adjust which factors it relies on. Instead of a simple "on/off" switch based on a regime, we can measure a factor's long-term performance and consistency.
+        *   **Implementation (`run_factor_stability_analysis`):** The model does not use static, predefined weights. It performs a historical analysis to calculate the time-series of each factor's pure return. It then calculates the **Sharpe Ratio of these factor returns**. This "Coefficient Sharpe Ratio" is a powerful measure of a factor's historical risk-adjusted performance and consistency. Factors with high and stable Sharpe Ratios receive higher weights in the final model. This is a direct, data-driven implementation of **IC-Based Weighting**.
+        """)
+
+    with st.expander("Ensuring Robustness (Data & Ranking Process)"):
+        st.markdown("#### Clean Data (Winsorization)")
+        st.markdown("""
+        *   **Concept:** Stock returns can have extreme daily jumps that are often noise rather than signal. These outliers can dramatically skew volatility and correlation calculations, making the model unstable.
+        *   **Implementation (`winsorize_returns`):** The script applies a robust winsorization technique. It doesn't just cap returns at a fixed percentage. Instead, it calculates a score for each return based on how many rolling standard deviations it is from the median, and caps only the most extreme statistical outliers. This cleans the data while preserving the integrity of the underlying distribution.
+        """)
+
+        st.markdown("#### Handle Ties Correctly")
+        st.markdown("""
+        *   **Concept:** When multiple stocks have the exact same factor score, they must be assigned the same rank to maintain statistical integrity.
+        *   **Implementation (Scoring block in `main`):** This is handled automatically and correctly by using the `pandas.DataFrame.rank()` method, which assigns the average rank to all tied elements by default.
+        """)
+
+    st.markdown("---")
+    st.write("By integrating these techniques, the model aims to be robust, adaptive, and based on signals that have been statistically purified and validated through historical analysis.")
 # --- Helper Functions ---
 def calculate_growth(current, previous):
     if pd.isna(current) or pd.isna(previous) or previous == 0: return np.nan
