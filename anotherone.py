@@ -35,7 +35,9 @@ from plotly.subplots import make_subplots
 # --- Basic Configuration ---
 logging.basicConfig(filename='stock_analysis.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 st.set_page_config(page_title="Quantitative Portfolio Analysis", layout="wide")
-
+RANDOM_SEED = 42
+random.seed(RANDOM_SEED)
+np.random.seed(RANDOM_SEED)
 # --- Data Structures and Mappings ---
 sector_etf_map = {
     'Technology': 'XLK', 'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC',
@@ -1999,22 +2001,81 @@ def calculate_relative_carry(results_df):
     results_df = results_df.drop(columns=['Carry_Numeric'])
 
     return results_df
-def simulate_historical_pure_returns(pure_returns_today):
+@st.cache_data(ttl=86400) # Cache the result for 24 hours
+def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'):
     """
-    SIMULATES a history of past Pure Factor Return tables.
-    """
-    if pure_returns_today is None:
-        return []
+    Generates a REAL history of pure factor returns by iterating backward in time.
+    This replaces the simulation and uses actual historical return data.
     
-    historical_data = []
-    for i in range(12): # Simulate 12 past "monthly" runs
-        noise = np.random.normal(0, 0.5, len(pure_returns_today))
-        drift = (12 - i) / 12 * 0.1
-        simulated_series = pure_returns_today + noise + drift
-        historical_data.append(simulated_series)
-        
-    historical_data.append(pure_returns_today)
-    return historical_data
+    Args:
+        _results_df (pd.DataFrame): The full dataframe of current characteristics.
+        _returns_dict (dict): Dictionary of historical LOG returns for all tickers.
+        time_horizons (dict): Mapping of horizon labels to return column names.
+        valid_metric_cols (list): List of factor columns to analyze.
+        steps (int): How many historical periods to analyze (e.g., 36 for 3 years of monthly data).
+        freq (str): The frequency of the analysis ('M' for month-end, 'W' for week-end).
+    
+    Returns:
+        dict: A dictionary where keys are time horizons (e.g., "1M") and values are
+              lists of historical pure return Series for that horizon.
+    """
+    logging.info(f"Starting REAL historical pure returns generation for {steps} steps...")
+    if not _returns_dict:
+        logging.error("Returns dictionary is empty. Cannot generate historical pure returns.")
+        return {h: [] for h in time_horizons}
+
+    # Create a single DataFrame from the returns dictionary
+    returns_df = pd.DataFrame(_returns_dict)
+    
+    # Get a date range for our historical analysis points
+    # Go back in time from the last available date in our returns data
+    end_date = returns_df.index.max()
+    date_range = pd.date_range(end=end_date, periods=steps, freq=f'-1{freq}')
+
+    historical_results_by_horizon = {h: [] for h in time_horizons}
+
+    # Loop backward through our specified dates
+    for analysis_date in tqdm(date_range, desc="Analyzing Historical Factor Performance"):
+        # For each factor return horizon (e.g., 21 days, 63 days)
+        for horizon_label, target_col in time_horizons.items():
+            
+            # 1. Determine the period for calculating forward returns
+            days_forward = int(target_col.split('_')[1][:-1])
+            start_idx_loc = returns_df.index.get_loc(analysis_date, method='nearest')
+            end_idx_loc = min(start_idx_loc + days_forward, len(returns_df) - 1)
+            
+            # Ensure we don't go out of bounds
+            if start_idx_loc >= end_idx_loc:
+                continue
+                
+            start_date = returns_df.index[start_idx_loc]
+            end_date = returns_df.index[end_idx_loc]
+
+            # 2. Calculate the actual forward returns for all stocks from 'analysis_date'
+            # We use cumulative sum of log returns, which is log(P_end / P_start)
+            forward_returns = returns_df.loc[start_date:end_date].sum()
+            
+            # Convert to a DataFrame and rename the column for the regression
+            forward_returns_df = forward_returns.to_frame(name=target_col)
+            
+            # 3. Merge with current characteristics.
+            # This is a key simplification: we assume characteristics (like P/E) are stable
+            # and use today's values as a proxy for historical ones. This is not perfect
+            # but is the best we can do without a point-in-time database.
+            analysis_df = _results_df.join(forward_returns_df, on='Ticker')
+            analysis_df = analysis_df.dropna(subset=[target_col])
+            
+            if analysis_df.empty or len(analysis_df) < 50: # Need enough stocks for a stable regression
+                continue
+
+            # 4. Calculate pure returns for this historical slice
+            pure_returns_slice = calculate_pure_returns(analysis_df, valid_metric_cols, target=target_col)
+            
+            if not pure_returns_slice.empty:
+                historical_results_by_horizon[horizon_label].append(pure_returns_slice)
+
+    logging.info("Finished REAL historical pure returns generation.")
+    return historical_results_by_horizon
 
 
 def analyze_coefficient_stability(historical_data):
@@ -2656,51 +2717,50 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
 @st.cache_data
-def run_factor_stability_analysis(_results_df, _all_possible_metrics, _reverse_metric_map):
+def run_factor_stability_analysis(_results_df, _returns_dict, _all_possible_metrics, _reverse_metric_map):
     """
-    Encapsulates the entire computationally expensive factor stability analysis 
-    into a single, cacheable function. This prevents re-running this heavy logic 
-    on every Streamlit script refresh, solving the infinite loading loop.
+    Encapsulates the entire computationally expensive factor stability analysis
+    into a single, cacheable function. This version uses a REAL historical
+    analysis instead of a simulation.
     """
-    # --- MODIFICATION START ---
-    # These map to the display names in METRIC_NAME_MAP
     time_horizons = {
-        "1W": "Return_5d",
-        "2W": "Return_10d",
-        "1M": "Return_21d",
-        "3M": "Return_63d",
-        "6M": "Return_126d",
-        "12M": "Return_252d",
+        "1W": "Return_5d", "2W": "Return_10d", "1M": "Return_21d",
+        "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d",
     }
-    # --- MODIFICATION END ---
     
     # Filter out metrics that are not numeric or are "Score" related
-    valid_metric_cols = [c for c in _results_df.columns if pd.api.types.is_numeric_dtype(_results_df[c]) and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']]
+    valid_metric_cols = [
+        c for c in _results_df.columns if pd.api.types.is_numeric_dtype(_results_df[c])
+        and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']
+    ]
+    
     stability_results = {}
 
-    logging.info("Starting cached factor stability analysis...")
-    for horizon_label, target_column_short_name in time_horizons.items(): # Renamed target_column
-        if target_column_short_name in _results_df.columns:
-            logging.info(f"Calculating pure returns for {horizon_label} horizon (Target: {target_column_short_name})...") # Added target name to log
-            
-            # Use the short name for the target column in calculate_pure_returns
-            pure_returns_today = calculate_pure_returns(_results_df, valid_metric_cols, target=target_column_short_name)
-            
-            if not pure_returns_today.empty:
-                # Simulate a list of Series, each representing pure factor returns for a date
-                historical_pure_returns = simulate_historical_pure_returns(pure_returns_today)
-                stability_df = analyze_coefficient_stability(historical_pure_returns)
-                stability_results[horizon_label] = stability_df
-            else:
-                logging.warning(f"Pure returns calculation failed for {horizon_label}, skipping stability analysis.")
+    logging.info("Starting cached factor stability analysis with REAL historical data...")
     
-    logging.info("Aggregating stability results...")
+    # --- THIS IS THE KEY CHANGE ---
+    # Call the new function to get a real history for all horizons at once.
+    # We pass the winsorized log returns here.
+    historical_pure_returns_by_horizon = generate_real_historical_pure_returns(
+        _results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'
+    )
+    # --- END OF KEY CHANGE ---
+
+    # Now, process the real historical results
+    for horizon_label, historical_runs in historical_pure_returns_by_horizon.items():
+        if historical_runs:
+            logging.info(f"Analyzing stability for {horizon_label} horizon with {len(historical_runs)} historical data points.")
+            stability_df = analyze_coefficient_stability(historical_runs)
+            stability_results[horizon_label] = stability_df
+        else:
+            logging.warning(f"No valid historical pure returns generated for {horizon_label}, skipping stability analysis.")
+    
+    logging.info("Aggregating stability results from real historical analysis...")
     auto_weights, rationale_df = aggregate_stability_and_set_weights(
         stability_results, _all_possible_metrics, _reverse_metric_map
     )
     
     return auto_weights, rationale_df, stability_results
-
 # The user's provided `robust_vol_calc` is more sophisticated and could be swapped in.
 @st.cache_data
 def get_all_prices_and_vols(_tickers, _returns_dict):
@@ -3879,16 +3939,26 @@ def main():
     
     # Macro regime analysis is displayed later in Tab 3, but no longer impacts weights directly here.
     
+# In your main() function, find this block and modify the call:
+
     with st.spinner("Analyzing stability of all factors (incl. advanced)..."):
         all_possible_metrics = list(default_weights.keys())
+        
+        # --- MODIFIED CALL ---
+        # Pass the winsorized_returns_dict to the function
         auto_weights, rationale_df, stability_results = run_factor_stability_analysis(
-            results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
+            results_df, winsorized_returns_dict, all_possible_metrics, REVERSE_METRIC_NAME_MAP
         )
+        # --- END OF MODIFICATION ---
         
         if not rationale_df.empty:
             rationale_df['Signal Direction'] = np.where(rationale_df['avg_sharpe_coeff'] >= 0, 'Positive ✅', 'Inverted 🔄')
-            active_weights = auto_weights # Use auto_weights directly, no regime adjustment
-            active_rationale = rationale_df # Update active_rationale
+            active_weights = auto_weights
+            active_rationale = rationale_df
+        else:
+            st.warning("Factor stability analysis failed, using default weights.")
+            active_weights = default_weights
+            active_rationale = pd.DataFrame()
         else:
             st.warning("Factor stability analysis failed, using default weights.")
             active_weights = default_weights # Fallback if stability analysis fails
