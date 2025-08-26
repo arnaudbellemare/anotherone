@@ -918,43 +918,53 @@ def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     Calculates the portfolio's beta exposure to a set of factors using regression.
     (CORRECTED to handle non-finite values before fitting the model)
     """
+    # --- STEP 0: Initial checks for empty inputs ---
     if portfolio_ts.empty or factor_returns_df.empty:
+        logging.warning("calculate_portfolio_factor_betas received empty inputs.")
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # 1. Align the data by finding the common dates
+    # --- STEP 1: Align the data by finding common dates ---
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
+    
+    if len(common_idx) < 20: # Need enough data points for a meaningful regression
+        logging.warning(f"Insufficient common data ({len(common_idx)}) for factor beta regression.")
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+        
     aligned_portfolio_ts = portfolio_ts.loc[common_idx]
     aligned_factor_returns = factor_returns_df.loc[common_idx]
 
-    # --- FIX START: Add robust data cleaning ---
-    # Replace any infinities with NaN, then fill all NaNs with 0.0.
-    # This ensures the data is clean before it's passed to the model.
+    # --- STEP 2 (THE CRITICAL FIX): Clean the aligned data ---
+    # `pct_change()` can create `inf` values (division by zero) and `NaN` values (missing data).
+    # Scikit-learn models cannot handle these. We must replace them before fitting.
+    # The standard practice is to replace them with 0.0, implying a neutral return for that period.
     aligned_portfolio_ts = aligned_portfolio_ts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     aligned_factor_returns = aligned_factor_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    # --- FIX END ---
 
-    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty or aligned_factor_returns.shape[1] == 0:
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-
-    # 2. Filter out factor columns that have zero variance (after cleaning)
+    # --- STEP 3: Filter out factor columns with no variance (after cleaning) ---
     X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6]
 
     if X_filtered.empty:
+        logging.warning("No factors with variance left after cleaning for beta regression.")
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # 3. Fit the Ridge regression model (this is now safe)
+    # --- STEP 4: Fit the Ridge regression model (now safe) with a final safeguard ---
     try:
         model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
-    except Exception as e:
-        logging.error(f"Ridge regression failed in calculate_portfolio_factor_betas even after cleaning: {e}")
+    except ValueError as ve: # Catch the specific error if cleaning somehow failed
+        logging.error(f"Ridge regression failed in calculate_portfolio_factor_betas with ValueError: {ve}. This indicates data might still be unclean.")
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+    except Exception as e: # Catch any other unexpected errors
+        logging.error(f"An unexpected error occurred during Ridge regression: {e}")
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-
-    # 4. Map coefficients back to original factor columns
+    # --- STEP 5: Map coefficients back to original factor columns ---
     full_betas = pd.Series(0.0, index=factor_returns_df.columns)
-    for i, col in enumerate(X_filtered.columns):
-        full_betas[col] = model.coef_[i]
-
+    
+    # Use the columns from X_filtered to ensure correct mapping
+    for i, col_name in enumerate(X_filtered.columns):
+        if col_name in full_betas.index:
+            full_betas[col_name] = model.coef_[i]
+        
     return full_betas
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
