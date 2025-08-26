@@ -5087,17 +5087,25 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-# --- Data Fetching and Initial Processing (Simplified & Corrected) ---
     with st.spinner("Fetching ETF and Macroeconomic histories..."):
         etf_histories = fetch_all_etf_histories(etf_list)
         macro_data = fetch_macro_data()
-    st.success("ETF and Macro data loaded.")
+    
+    # --- FIX: ADD THIS STEP ---
+    # You need a function to fetch all individual stock histories.
+    # Let's assume you have a function called fetch_all_stock_histories.
+        all_stock_histories = fetch_all_stock_histories(tickers) 
+    # --- END OF FIX ---
 
-# This is the simpler, original way to process tickers. It's more reliable for debugging.
+    st.success("All data loaded.")
+
     with st.spinner(f"Processing {len(tickers)} tickers..."):
-    # The call now only takes 3 arguments, as it should for this logic.
+    # --- FIX: Pass the fourth argument ---
         results_df, failed_tickers, returns_dict = process_tickers(
-            tickers, etf_histories, sector_etf_map
+            tickers, 
+            etf_histories, 
+            sector_etf_map,
+            all_stock_histories  # Provide the missing argument
         )
 
 # Step 4: Validate results (this part remains the same).
