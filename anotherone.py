@@ -3804,61 +3804,91 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
 # --- REPLACE your ENTIRE existing process_tickers function with this one ---
 # --- USE THIS. THIS IS THE CORRECT process_tickers FUNCTION. ---
 
+# =================================================================================
+# --- THIS IS THE CORRECT AND COMPLETE process_tickers FUNCTION ---
+# =================================================================================
+
 @st.cache_data
 def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
     """
-    Processes tickers using pre-fetched historical data. Accepts 4 arguments.
+    Processes tickers using pre-fetched historical data. This is the efficient version.
+    
+    Args:
+        _tickers (list): List of ticker symbols to process.
+        _etf_histories (dict): Dictionary of pre-fetched ETF history DataFrames.
+        _sector_etf_map (dict): Mapping of sectors to ETFs.
+        _all_histories (dict): Dictionary of pre-fetched stock history DataFrames from fetch_all_histories_robustly.
     """
     results, returns_dict, failed_tickers = [], {}, []
 
+    # Stage 1: Fetch all non-historical data (info, financials, etc.) in parallel.
+    # This is done first because it's a common point of failure (e.g., rate limiting).
     all_other_data = {}
     with ThreadPoolExecutor(max_workers=10) as executor:
         def fetch_non_history_data(ticker_symbol):
+            """Helper to fetch all yfinance objects for a single ticker."""
             ticker = yf.Ticker(ticker_symbol)
+            # The .info can be slow, so it's the main target for parallelization.
             return (ticker, ticker.info, ticker.financials, ticker.balance_sheet, ticker.cashflow, 
                     ticker.quarterly_financials, ticker.quarterly_balance_sheet, ticker.quarterly_cashflow)
 
         future_to_fetch = {executor.submit(fetch_non_history_data, ticker): ticker for ticker in _tickers}
+        
         for future in tqdm(as_completed(future_to_fetch), total=len(_tickers), desc="Fetching Financials & Info"):
             ticker_symbol = future_to_fetch[future]
             try:
+                # Store all fetched data in a dictionary keyed by the ticker
                 all_other_data[ticker_symbol] = future.result()
             except Exception as e:
+                logging.error(f"Failed to fetch non-history data for {ticker_symbol}: {e}")
                 failed_tickers.append(ticker_symbol)
 
+    # Stage 2: Process all the gathered data in parallel. This is CPU-bound.
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_process = {}
         for ticker_symbol in _tickers:
+            # Skip tickers that failed the previous fetching stage or have no history
             if ticker_symbol in failed_tickers or ticker_symbol not in _all_histories:
                 continue
+            
+            # Retrieve the pre-fetched data for this specific ticker
             history = _all_histories[ticker_symbol]
             (ticker_obj, info, financials, balancesheet, cashflow,
              q_financials, q_balancesheet, q_cashflow) = all_other_data[ticker_symbol]
             
+            # Submit the processing task. This calls the 12-argument version of process_single_ticker.
             future = executor.submit(
-                process_single_ticker, ticker_symbol, _etf_histories, _sector_etf_map,
+                process_single_ticker, 
+                ticker_symbol, _etf_histories, _sector_etf_map,
                 ticker_obj, history, info, financials, balancesheet, cashflow,
                 q_financials, q_balancesheet, q_cashflow
             )
             future_to_process[future] = ticker_symbol
 
-        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Processing Metrics"):
+        for future in tqdm(as_completed(future_to_process), total=len(future_to_process), desc="Calculating All Metrics"):
             ticker = future_to_process[future]
             try:
+                # The process_single_ticker function should return a dictionary of metrics and a Series of returns
                 result_metrics_dict, log_returns_series = future.result()
                 results.append(result_metrics_dict)
+                
                 if log_returns_series is not None and not log_returns_series.empty:
                     returns_dict[ticker] = log_returns_series
             except Exception as e:
+                logging.error(f"Failed during metric calculation for {ticker}: {e}")
                 failed_tickers.append(ticker)
     
+    # Final DataFrame creation and cleaning
     if not results:
         return pd.DataFrame(), failed_tickers, {}
     
+    # Create the DataFrame from the list of dictionaries
     results_df = pd.DataFrame(results).reindex(columns=columns)
     
+    # Robustly clean and fill the final DataFrame
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
     results_df[numeric_cols] = results_df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+    
     for col in results_df.select_dtypes(include=np.number).columns:
         if results_df[col].isna().all():
             results_df[col] = 0.0
@@ -3869,6 +3899,10 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map, _all_histories):
             results_df[col] += np.random.normal(0, 0.01, len(results_df))
     
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
+
+# =================================================================================
+# --- END OF FUNCTION ---
+# =================================================================================
 @st.cache_data
 def run_factor_stability_analysis(_results_df, _all_possible_metrics, _reverse_metric_map):
     """
