@@ -3986,6 +3986,8 @@ def main():
             results_df['CS_Mean_Reversion'] = np.nan # Ensure column exists if it was to be used
     st.success("Advanced signals generated.")
 
+# In main()
+
     # --- Automatic Factor Weighting ---
     st.sidebar.subheader("Factor Weighting")
     active_weights = default_weights # Initialize with defaults
@@ -3994,18 +3996,16 @@ def main():
     
     # Macro regime analysis is displayed later in Tab 3, but no longer impacts weights directly here.
     
-# In your main() function, find this block and modify the call:
-
     with st.spinner("Analyzing stability of all factors (incl. advanced)..."):
         all_possible_metrics = list(default_weights.keys())
         
-        # --- MODIFIED CALL ---
-        # Pass the winsorized_returns_dict to the function
+        # Call the function to get a real history for all horizons at once.
         auto_weights, rationale_df, stability_results = run_factor_stability_analysis(
             results_df, winsorized_returns_dict, all_possible_metrics, REVERSE_METRIC_NAME_MAP
         )
-        # --- END OF MODIFICATION ---
         
+        # --- THIS IS THE CORRECTED BLOCK ---
+        # There should only be ONE if/else statement here.
         if not rationale_df.empty:
             rationale_df['Signal Direction'] = np.where(rationale_df['avg_sharpe_coeff'] >= 0, 'Positive ✅', 'Inverted 🔄')
             active_weights = auto_weights
@@ -4014,12 +4014,10 @@ def main():
             st.warning("Factor stability analysis failed, using default weights.")
             active_weights = default_weights
             active_rationale = pd.DataFrame()
-        else:
-            st.warning("Factor stability analysis failed, using default weights.")
-            active_weights = default_weights # Fallback if stability analysis fails
-            active_rationale = pd.DataFrame() # Ensure it's empty
+        # --- END OF CORRECTION ---
 
     if not active_rationale.empty:
+        # ... the rest of your main function continues here ...
         with st.sidebar.expander("View Factor Model Rationale", expanded=True):
             display_rationale = active_rationale[['avg_sharpe_coeff', 'consistency_score', 'Signal Direction']].copy()
             display_rationale['Final_Weight'] = display_rationale.index.map(lambda short_name: active_weights.get(METRIC_NAME_MAP.get(short_name, short_name), 0.0))
