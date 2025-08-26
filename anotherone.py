@@ -2287,35 +2287,87 @@ def calculate_pure_returns(df, characteristics, target='Return_252d', vif_thresh
         return pd.Series(dtype=float, name="PureReturns")
 # We will use a simplified vol calculation here for demonstration.
 
-def calculate_ewma_volatility(returns_series, span=63, annualize=True):
+# --- Helper functions for robust volatility (add these to your script) ---
+BUSINESS_DAYS_IN_YEAR = 252 # Common assumption for financial calculations
+
+def resample_prices_to_business_day_index(price: pd.Series) -> pd.Series:
     """
-    Calculates Exponentially Weighted Moving Average (EWMA) volatility.
-    
+    Resamples a price series to a daily (business day) frequency, forward-filling NaNs.
+    Assumes `price` series has a DatetimeIndex.
+    """
+    if price.empty:
+        return price
+    if not isinstance(price.index, pd.DatetimeIndex):
+        price.index = pd.to_datetime(price.index)
+    return price.resample('B').ffill().dropna()
+
+def simple_ewvol_calc(
+    daily_returns: pd.Series, days: int = 35, min_periods: int = 10, **ignored_kwargs
+) -> pd.Series:
+    if daily_returns.empty or len(daily_returns.dropna()) < min_periods:
+        return pd.Series(np.nan, index=daily_returns.index)
+    vol = daily_returns.ewm(adjust=True, span=days, min_periods=min_periods).std()
+    return vol
+
+def apply_min_vol(vol: pd.Series, vol_abs_min: float = 0.0000000001) -> pd.Series:
+    if vol.empty: return pd.Series(dtype=float)
+    temp_vol = vol.copy()
+    temp_vol[temp_vol < vol_abs_min] = vol_abs_min
+    return temp_vol
+
+def apply_vol_floor(
+    vol: pd.Series,
+    floor_min_quant: float = 0.05,
+    floor_min_periods: int = 100,
+    floor_days: int = 500,
+) -> pd.Series:
+    if vol.empty: return pd.Series(dtype=float)
+    vol_min = vol.rolling(window=floor_days, min_periods=floor_min_periods).quantile(q=floor_min_quant)
+    if not vol_min.empty:
+        vol_min = vol_min.fillna(0.0).ffill()
+    else:
+        return vol
+    vol_floored = np.maximum(vol, vol_min)
+    return vol_floored
+
+def backfill_vol(vol: pd.Series) -> pd.Series:
+    if vol.empty: return pd.Series(dtype=float)
+    vol_forward_fill = vol.ffill()
+    vol_backfilled = vol_forward_fill.bfill()
+    return vol_backfilled
+
+# --- MODIFIED `calculate_ewma_volatility` FUNCTION ---
+# This is the function you should replace.
+def calculate_ewma_volatility(returns_series: pd.Series, span: int = 35, annualize: bool = True):
+    """
+    Calculates a robust, exponential volatility. This function replaces the simpler
+    EWMA volatility calculation with a more advanced version that handles floors and minimums.
+
     Args:
         returns_series (pd.Series): Daily percentage returns.
-        span (int): The span for the EWMA calculation (e.g., 63 for approx 3 months).
+        span (int): The number of days in lookback for EWMA.
         annualize (bool): Whether to annualize the volatility.
-        
+
     Returns:
-        pd.Series: EWMA conditional volatility.
+        pd.Series: Robustly calculated conditional volatility.
     """
-    if returns_series.empty or len(returns_series.dropna()) < 2:
+    if returns_series.empty or returns_series.isnull().all():
         return pd.Series(np.nan, index=returns_series.index)
-    
-    # Square the returns to get daily variances
-    squared_returns = returns_series.dropna()**2
-    
-    # Calculate EWMA of squared returns to get conditional variance
-    ewma_variance = squared_returns.ewm(span=span, adjust=False).mean()
-    
-    # Take the square root to get conditional volatility
-    ewma_vol = np.sqrt(ewma_variance)
-    
+
+    # Core robust calculation using the helper functions
+    vol = simple_ewvol_calc(returns_series, days=span, min_periods=int(span/3))
+    if vol.empty:
+        return pd.Series(np.nan, index=returns_series.index)
+
+    vol = apply_min_vol(vol)
+    vol = apply_vol_floor(vol, floor_days=252, floor_min_periods=100) # Use reasonable defaults
+    vol = backfill_vol(vol)
+
     if annualize:
-        ewma_vol *= np.sqrt(252) # Annualize daily volatility
-        
-    # Reindex to original returns series to maintain length, filling initial NaNs
-    return ewma_vol.reindex(returns_series.index, method='ffill').bfill()
+        vol *= np.sqrt(BUSINESS_DAYS_IN_YEAR)
+
+    # Reindex to ensure the final series has the same index as the input
+    return vol.reindex(returns_series.index, method='ffill').bfill()
 
 
 @lru_cache(maxsize=1024)
