@@ -2060,19 +2060,7 @@ def calculate_relative_carry(results_df):
 def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'):
     """
     Generates a REAL history of pure factor returns by iterating backward in time.
-    This replaces the simulation and uses actual historical return data.
-    
-    Args:
-        _results_df (pd.DataFrame): The full dataframe of current characteristics.
-        _returns_dict (dict): Dictionary of historical LOG returns for all tickers.
-        time_horizons (dict): Mapping of horizon labels to return column names.
-        valid_metric_cols (list): List of factor columns to analyze.
-        steps (int): How many historical periods to analyze (e.g., 36 for 3 years of monthly data).
-        freq (str): The frequency of the analysis ('M' for month-end, 'W' for week-end).
-    
-    Returns:
-        dict: A dictionary where keys are time horizons (e.g., "1M") and values are
-              lists of historical pure return Series for that horizon.
+    (CORRECTED to handle timezone issues and use a more robust indexer)
     """
     logging.info(f"Starting REAL historical pure returns generation for {steps} steps...")
     if not _returns_dict:
@@ -2081,49 +2069,57 @@ def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horiz
 
     # Create a single DataFrame from the returns dictionary
     returns_df = pd.DataFrame(_returns_dict)
-    
-    # Get a date range for our historical analysis points
-    # Go back in time from the last available date in our returns data
+
+    # --- FIX START: Ensure index is sorted and timezone-naive ---
+    if not returns_df.index.is_monotonic_increasing:
+        returns_df.sort_index(inplace=True)
+    if returns_df.index.tz is not None:
+        returns_df.index = returns_df.index.tz_localize(None)
+    # --- FIX END ---
+
+    if returns_df.empty:
+        logging.error("Historical returns DataFrame is empty after creation.")
+        return {h: [] for h in time_horizons}
+
     end_date = returns_df.index.max()
-    date_range = pd.date_range(end=end_date, periods=steps, freq=f'-1{freq}')
+    # Also ensure the date_range is timezone-naive (it is by default, but this is explicit)
+    date_range = pd.date_range(end=end_date, periods=steps, freq=f'-1{freq}').tz_localize(None)
 
     historical_results_by_horizon = {h: [] for h in time_horizons}
 
-    # Loop backward through our specified dates
     for analysis_date in tqdm(date_range, desc="Analyzing Historical Factor Performance"):
-        # For each factor return horizon (e.g., 21 days, 63 days)
         for horizon_label, target_col in time_horizons.items():
-            
-            # 1. Determine the period for calculating forward returns
             days_forward = int(target_col.split('_')[1][:-1])
-            start_idx_loc = returns_df.index.get_loc(analysis_date, method='nearest')
+
+            # --- FIX START: Use robust get_indexer instead of get_loc ---
+            try:
+                # get_indexer is more robust for finding the nearest integer position
+                start_idx_loc_arr = returns_df.index.get_indexer([analysis_date], method='nearest')
+                if start_idx_loc_arr[0] == -1: # Indicates no valid location found
+                    continue
+                start_idx_loc = start_idx_loc_arr[0]
+            except Exception as e:
+                logging.warning(f"Could not find index location for {analysis_date}: {e}. Skipping.")
+                continue
+            # --- FIX END ---
+
             end_idx_loc = min(start_idx_loc + days_forward, len(returns_df) - 1)
             
-            # Ensure we don't go out of bounds
             if start_idx_loc >= end_idx_loc:
                 continue
                 
             start_date = returns_df.index[start_idx_loc]
             end_date = returns_df.index[end_idx_loc]
 
-            # 2. Calculate the actual forward returns for all stocks from 'analysis_date'
-            # We use cumulative sum of log returns, which is log(P_end / P_start)
             forward_returns = returns_df.loc[start_date:end_date].sum()
-            
-            # Convert to a DataFrame and rename the column for the regression
             forward_returns_df = forward_returns.to_frame(name=target_col)
             
-            # 3. Merge with current characteristics.
-            # This is a key simplification: we assume characteristics (like P/E) are stable
-            # and use today's values as a proxy for historical ones. This is not perfect
-            # but is the best we can do without a point-in-time database.
             analysis_df = _results_df.join(forward_returns_df, on='Ticker')
             analysis_df = analysis_df.dropna(subset=[target_col])
             
-            if analysis_df.empty or len(analysis_df) < 50: # Need enough stocks for a stable regression
+            if analysis_df.empty or len(analysis_df) < 50:
                 continue
 
-            # 4. Calculate pure returns for this historical slice
             pure_returns_slice = calculate_pure_returns(analysis_df, valid_metric_cols, target=target_col)
             
             if not pure_returns_slice.empty:
