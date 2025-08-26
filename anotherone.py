@@ -3800,30 +3800,6 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
 # REPLACE your existing process_tickers function with this one
 
 # --- REPLACE your ENTIRE existing process_tickers function with this one ---
-
-def fetch_all_histories_robustly(tickers, period="7y"):
-    """
-    Uses the more reliable yf.download() to fetch all historical data in a single batch.
-    """
-    print(f"Executing robust bulk download for {len(tickers)} tickers...")
-    all_data = yf.download(tickers, period=period, auto_adjust=True, group_by='ticker', progress=False)
-    histories_dict = {}
-    if all_data is None or all_data.empty:
-        logging.error("CRITICAL: yf.download() returned no data at all. Check network or ticker validity.")
-        return histories_dict
-    for ticker in tickers:
-        try:
-            ticker_history = all_data[ticker].dropna(how='all')
-            if not ticker_history.empty and len(ticker_history) > 252:
-                ticker_history.index = ticker_history.index.tz_localize(None)
-                histories_dict[ticker] = ticker_history
-            else:
-                logging.warning(f"No valid/sufficient history for {ticker} in bulk download (rows: {len(ticker_history)}).")
-        except KeyError:
-            logging.warning(f"Ticker {ticker} not found in bulk download result (KeyError).")
-    print(f"Successfully retrieved valid history for {len(histories_dict)} out of {len(tickers)} tickers.")
-    return histories_dict
-
 # --- USE THIS. THIS IS THE CORRECT process_tickers FUNCTION. ---
 
 @st.cache_data
@@ -5734,61 +5710,6 @@ def main():
             st.dataframe(results_df, use_container_width=True)
         else:
             st.info("No processed data available.")
-def debug_process_tickers():
-    """
-    A single-threaded, verbose version of process_tickers to find the hidden error.
-    """
-    print("--- RUNNING VERBOSE DEBUGGER ---")
-    
-    # Use a small, diverse list of tickers for testing
-    debug_tickers = ["MSFT", "GOOG", "JNJ"] 
-    
-    print("Fetching dummy ETF data for the test...")
-    try:
-        etf_histories = {'SPY': yf.Ticker('SPY').history(period="3y")}
-        print("...Dummy ETF data fetched successfully.")
-    except Exception as e:
-        print(f"!!! CRITICAL: Could not fetch even basic ETF data. Check yfinance or network. Error: {e}")
-        return
 
-    returns_dict = {}
-    failed_tickers = []
-
-    print("\n>>> Processing tickers one-by-one to expose the error...")
-    for ticker in debug_tickers:
-        print(f"\n----------------------------------")
-        print(f"--- Attempting to process: {ticker} ---")
-        print(f"----------------------------------")
-        try:
-            # This directly calls the function we need to inspect
-            # The 'except' block here will catch the real error
-            result_list, log_returns = process_single_ticker(ticker, etf_histories, sector_etf_map)
-            
-            if log_returns is not None and not log_returns.empty:
-                print(f"✅ SUCCESS for {ticker}. Log returns were generated.")
-                returns_dict[ticker] = log_returns
-            else:
-                print(f"⚠️  WARNING for {ticker}: The function completed but returned an EMPTY log_returns series.")
-                failed_tickers.append(ticker)
-
-        except Exception as e:
-            # THIS IS THE MOST IMPORTANT PART. IT WILL PRINT THE REAL ERROR.
-            print(f"💥💥💥 FATAL ERROR for {ticker}: The function crashed with an unhandled exception. THIS IS THE ROOT CAUSE. 💥💥💥")
-            import traceback
-            traceback.print_exc() # This prints the full error, including the exact line number.
-            failed_tickers.append(ticker)
-
-    print("\n====================")
-    print("--- DEBUG SUMMARY ---")
-    print(f"Successfully processed: {list(returns_dict.keys())}")
-    print(f"Failed to process: {failed_tickers}")
-    if not returns_dict:
-        print("\n>>> CONCLUSION: The 'returns_dict' is empty. The traceback printed above for the first failed ticker is the problem you need to solve.")
-    else:
-        print("\n>>> CONCLUSION: Some tickers succeeded. The error is likely specific to the data of the failed tickers.")
-
-# --- This runs our debugger instead of the Streamlit app ---
 if __name__ == "__main__":
-    debug_process_tickers()
-#if __name__ == "__main__":
-    #main()
+    main()
