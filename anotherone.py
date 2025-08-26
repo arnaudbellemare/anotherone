@@ -916,30 +916,45 @@ def plot_factor_exposure_breakdown(portfolio_betas):
 def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     """
     Calculates the portfolio's beta exposure to a set of factors using regression.
+    (CORRECTED to handle non-finite values before fitting the model)
     """
-    if portfolio_ts.empty or factor_returns_df.empty: # Added robustness checks
+    if portfolio_ts.empty or factor_returns_df.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
+    # 1. Align the data by finding the common dates
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
     aligned_portfolio_ts = portfolio_ts.loc[common_idx]
     aligned_factor_returns = factor_returns_df.loc[common_idx]
-    
-    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty or aligned_factor_returns.shape[1] == 0: # Added length check
+
+    # --- FIX START: Add robust data cleaning ---
+    # Replace any infinities with NaN, then fill all NaNs with 0.0.
+    # This ensures the data is clean before it's passed to the model.
+    aligned_portfolio_ts = aligned_portfolio_ts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    aligned_factor_returns = aligned_factor_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # --- FIX END ---
+
+    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty or aligned_factor_returns.shape[1] == 0:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Filter out columns from aligned_factor_returns that have zero variance
-    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6] # Added filtering
-    
-    if X_filtered.empty: # Added check for empty filtered factors
+    # 2. Filter out factor columns that have zero variance (after cleaning)
+    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6]
+
+    if X_filtered.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
-    
-    # Map coefficients back to original factor_returns_df columns
+    # 3. Fit the Ridge regression model (this is now safe)
+    try:
+        model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
+    except Exception as e:
+        logging.error(f"Ridge regression failed in calculate_portfolio_factor_betas even after cleaning: {e}")
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+
+
+    # 4. Map coefficients back to original factor columns
     full_betas = pd.Series(0.0, index=factor_returns_df.columns)
     for i, col in enumerate(X_filtered.columns):
         full_betas[col] = model.coef_[i]
-        
+
     return full_betas
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
