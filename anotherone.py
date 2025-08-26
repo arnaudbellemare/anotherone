@@ -1314,7 +1314,25 @@ def fetch_all_stock_histories(_stock_tickers, period="5y"):
                 logging.error(f"Failed to fetch stock history for {ticker}: {e}")
                 
     return stock_histories
+@lru_cache(maxsize=None)
+def fetch_etf_history(ticker, period="3y"):
+    history = yf.Ticker(ticker).history(period=period, auto_adjust=True, interval="1d")
+    if history.empty or 'Close' not in history.columns: raise ValueError(f"No valid data for {ticker}")
+    history.index = history.index.tz_localize(None)
+    history.dropna(subset=['Close'], inplace=True) # This inplace is safe, not on a chained copy
+    if history['Close'].eq(0).any(): raise ValueError(f"Zero Close prices for {ticker}")
+    return history
 
+@st.cache_data
+def fetch_all_etf_histories(_etf_list, period="3y"):
+    etf_histories = {}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_etf = {executor.submit(fetch_etf_history, etf, period): etf for etf in _etf_list}
+        for future in tqdm(as_completed(future_to_etf), total=len(_etf_list), desc="Fetching ETF Histories"):
+            etf = future_to_etf[future]
+            try: etf_histories[etf] = future.result()
+            except Exception as e: logging.error(f"Failed to fetch ETF history for {etf}: {e}")
+    return etf_histories
 # --- END OF ADDED CODE ---
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
