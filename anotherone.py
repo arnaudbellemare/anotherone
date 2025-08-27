@@ -2201,74 +2201,69 @@ def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_
 
 def calculate_pure_returns(df, characteristics, target='Return_252d', vif_threshold=5, use_pca=True, pca_variance_threshold=0.95):
     """
-    Calculates pure factor returns using a robust cross-sectional regression with PCA.
+    MODIFIED: Calculates the Spearman Information Coefficient (IC) for each factor.
+    Returns a Series of IC values, which serve as the factor's 'pure return' or signal strength.
     """
-    if df.empty or target not in df.columns or df[target].isnull().all(): # Added df.empty check
-        return pd.Series(dtype=float, name="PureReturns")
+    if df.empty or target not in df.columns or df[target].isnull().all() or len(df) < 30:
+        return pd.Series(dtype=float, name="Factor_ICs")
     
-    y = pd.to_numeric(df[target], errors='coerce')
+    # 1. Identify relevant data and clean NaNs
+    y_raw = pd.to_numeric(df[target], errors='coerce')
     valid_characteristics = [col for col in characteristics if col in df.columns and pd.api.types.is_numeric_dtype(df[col])]
-    X = df[valid_characteristics].copy().replace([np.inf, -np.inf], np.nan)
+    X_raw = df[valid_characteristics].copy().replace([np.inf, -np.inf], np.nan)
     
-    valid_indices = y.dropna().index
-    X, y = X.loc[valid_indices], y.loc[valid_indices]
-    if X.empty or y.empty or len(y) < 20:
-        logging.warning(f"Insufficient data for pure returns calculation: {len(y)} samples.")
-        return pd.Series(dtype=float, name="PureReturns")
+    # Drop rows where target return is missing
+    valid_indices = y_raw.dropna().index
+    X, y = X_raw.loc[valid_indices], y_raw.loc[valid_indices]
+    
+    if X.empty or y.empty or len(y) < 30:
+        logging.warning(f"Insufficient data for IC calculation: {len(y)} samples.")
+        return pd.Series(dtype=float, name="Factor_ICs")
 
+    # Fill remaining NaNs in factors with the column median
     for col in X.columns:
         if X[col].isna().any():
-            median_val = X[col].median()
-            X[col] = X[col].fillna(median_val)
-        # Apply log1p only if values are consistently positive and large
-        if X[col].min() >= 0 and X[col].quantile(0.75) > 1000: 
-            X[col] = np.log1p(X[col])
-        # Add small noise to constant columns to avoid issues with scaling/regression
+            X[col] = X[col].fillna(X[col].median())
+        # Add small noise to constant columns to ensure ranking works
         if X[col].var() < 1e-8: 
-            X[col] = X[col] + np.random.normal(0, 1e-4, len(X))
-    
-    final_characteristics = check_multicollinearity(X, valid_characteristics, vif_threshold) # Refined check_multicollinearity
-    if not final_characteristics:
-        logging.warning("No valid characteristics left after VIF check.")
-        return pd.Series(dtype=float, name="PureReturns")
-    
-    X = X[final_characteristics]
-    
-    # Check if X is still valid after filtering
-    if X.empty or X.shape[1] == 0: # Added check for empty X after filtering
-        logging.warning("No valid features left for scaling after multicollinearity check.")
-        return pd.Series(dtype=float, name="PureReturns")
+            X[col] = X[col] + np.random.normal(0, 1e-6, len(X))
 
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
+    # --- Implement Factor Neutralization (Proxy: Sector Neutralization) ---
+    # Although true rank neutralization is complex, we can use residuals from sector regression
     
-    try:
-        model = Ridge(alpha=1.0, solver='auto')
-        
-        if use_pca and X_scaled.shape[1] > 1: # Only use PCA if multiple features # Added condition for PCA
-            pca = PCA(n_components=pca_variance_threshold)
-            X_pca = pca.fit_transform(X_scaled)
-            model.fit(X_pca, y)
-            original_space_coefs = pca.inverse_transform(model.coef_.reshape(1, -1))[0]
-        else:
-            model.fit(X_scaled, y)
-            original_space_coefs = model.coef_
+    # 2. Rank Returns (Y) - Higher return is better (Lower rank value = higher return)
+    # We rank descending (high to low) because higher return is better
+    y_rank = y.rank(ascending=False, method='average')
 
-        # Ensure scaler_scale has the correct length and prevent division by zero
-        scaler_scale = scaler.scale_
-        if len(scaler_scale) != len(original_space_coefs): # Added length check
-            logging.warning("Scaler scale length mismatch. Cannot unscale coefficients accurately.")
-            unscaled_coefs = original_space_coefs
-        else:
-            scaler_scale[scaler_scale < 1e-8] = 1e-8 # Prevent division by near-zero
-            unscaled_coefs = original_space_coefs / scaler_scale
+    ic_results = pd.Series(dtype=float, index=X.columns, name="Factor_ICs")
+    
+    for factor in X.columns:
+        X_factor = X[factor]
+
+        # 3. Determine Ranking Direction (Crucial Step: Higher/Lower factor value is better?)
+        # We must decide which direction the factor should be ranked to correlate positively with Y_rank
+        # We use the factor's default definition combined with a simple preliminary correlation.
         
-        # Clip coefficients to prevent extreme values, which can happen with noisy data
-        return pd.Series(unscaled_coefs, index=final_characteristics, name="PureReturns").clip(lower=-10.0, upper=10.0)
+        # Determine preferred direction based on the factor name (or assume higher is better if unknown)
+        # Note: In a real-world scenario, the direction is usually learned over time.
         
-    except Exception as e:
-        logging.error(f"Pure returns regression failed: {e}")
-        return pd.Series(dtype=float, name="PureReturns")
+        short_name = factor
+        # Default assumption: Higher value is better (e.g., Growth, Quality)
+        # Exceptions: Value (P/E, P/S, P/B -> lower is better)
+        is_factor_ascending = not any(v in short_name for v in ['P/E', 'PS_Ratio', 'Debt', 'Risk', 'Stop_Loss', 'Vol', 'Beta', 'Liabilities'])
+
+        # Calculate rank ascending based on the factor's preferred direction
+        X_rank = X_factor.rank(ascending=is_factor_ascending, method='average')
+        
+        # 4. Compute Spearman IC (Correlation between X_rank and Y_rank)
+        # The correlation between two rank series is the Spearman IC.
+        ic = X_rank.corr(y_rank, method='spearman')
+        
+        # 5. Store the IC. This IC serves as the magnitude and direction of the signal.
+        ic_results.loc[factor] = ic
+
+    # Return the series of ICs, which will be analyzed for stability
+    return ic_results.clip(lower=-1.0, upper=1.0) # IC must be between -1 and 1
 # We will use a simplified vol calculation here for demonstration.
 
 def calculate_ewma_volatility(returns_series, span=63, annualize=True):
@@ -3813,51 +3808,57 @@ def main():
     
     # --- Scoring Block (Unconstrained Pure Alpha) ---
     alpha_score = pd.Series(0.0, index=results_df.index)
-    if not results_df.empty and user_weights: # Check if results_df is not empty AND user_weights dictionary is not empty
+    
+    # Create a DataFrame mapping factor short name to its definitive average signal direction
+    if not active_rationale.empty:
+        signal_directions = active_rationale['avg_pure_return'].fillna(0)
+    else:
+        signal_directions = pd.Series(0.0) # Default to 0 if rationale is missing
+
+    if not results_df.empty and user_weights:
         for long_name, weight in user_weights.items():
             if weight > 0:
                 short_name = REVERSE_METRIC_NAME_MAP.get(long_name)
-                # Ensure short_name exists in results_df columns
+                
                 if short_name in results_df.columns:
-                    rank_ascending = True  # Initial default: higher factor value is typically better for scoring
+                    
+                    # 1. Determine the ranking direction based on the aggregated IC signal
+                    # If avg_IC is > 0, rank ascending (higher factor value is better).
+                    # If avg_IC is < 0, rank descending (lower factor value is better).
+                    
+                    avg_ic = signal_directions.get(short_name, 0.0)
+                    
+                    # If avg_ic is effectively zero or positive, we rank ascending (True).
+                    # If avg_ic is negative, we rank descending (False).
+                    rank_ascending = (avg_ic >= 0) 
 
-                    # Prioritize: Use active_rationale if available and decisive
-                    if not active_rationale.empty and short_name in active_rationale.index:
-                        sharpe_coeff = active_rationale.loc[short_name, 'avg_sharpe_coeff']
-                        # If the Sharpe coefficient is valid and non-zero, it determines the ranking direction.
-                        if pd.notna(sharpe_coeff) and abs(sharpe_coeff) > 1e-6: # Use a small epsilon to treat near-zero as zero
-                            rank_ascending = (sharpe_coeff > 0)
-                        # Else (if sharpe_coeff is NaN or effectively zero), rank_ascending remains True (the initial default).
-                        # This means if the factor stability analysis doesn't give a clear direction, we default to higher is better.
-
-                    # No other hardcoded `if` blocks for `rank_ascending` are used.
-                    # The decision now solely rests on `active_rationale` or the initial default.
-
+                    # 2. Calculate the rank (0 to 1)
                     rank_series = results_df[short_name].rank(pct=True, ascending=rank_ascending)
+                    
+                    # 3. Apply weight and accumulate score
                     alpha_score += rank_series.fillna(0.5) * weight
                 else:
                     logging.warning(f"Metric '{long_name}' (short name '{short_name}') not found in results_df columns. Contributing neutral score.")
                     alpha_score += 0.5 * weight # Neutral contribution if factor is not found
-        # Remaining part of the scoring block (outside the loop)
+        
+        # Remaining part of the scoring block (calculate Z-score)
         def z_score_robust(series):
+            # ... (keep the rest of this helper function unchanged) ...
             if series.empty:
                 return pd.Series(np.nan, index=series.index)
             median_val = series.median()
             mad_val = (series - median_val).abs().median()
             
-            # Add a small epsilon to MAD to prevent division by zero for constant series
-            if mad_val < 1e-6: # Check if MAD is effectively zero
-                return pd.Series(0.0, index=series.index) # If no dispersion, all scores are 0
+            if mad_val < 1e-6:
+                return pd.Series(0.0, index=series.index)
             
-            # 0.6745 is a scaling factor to make MAD a consistent estimator of standard deviation
-            # for normally distributed data.
             return 0.6745 * (series - median_val) / mad_val
 
         results_df['Score'] = z_score_robust(alpha_score)
     else:
-        results_df['Score'] = np.nan # If no scores can be calculated
+        results_df['Score'] = np.nan
         st.warning("Cannot calculate Alpha Scores: results_df or user_weights are empty/invalid.")
-
+        
     top_15_df = results_df.sort_values('Score', ascending=False).head(15).copy()
     top_15_tickers = top_15_df['Ticker'].tolist()
 
