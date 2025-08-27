@@ -2147,42 +2147,44 @@ def calculate_portfolio_factor_correlations(weighted_df, etf_histories, period="
 def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_metric_map):
     """
     Aggregates stability metrics from multiple time horizons and sets final portfolio weights.
+    This is the deterministic replacement for the simulation-based method.
     """
     if not stability_results:
         return {metric: 0.0 for metric in all_metrics}, pd.DataFrame()
 
+    # Collect all factors present across all horizons
     all_factors = set()
-    for horizon, df in stability_results.items():
-        all_factors.update(df.index)
+    for horizon, df_series in stability_results.items():
+        all_factors.update(df_series.index)
 
     agg_df = pd.DataFrame(index=list(all_factors))
-    agg_df['avg_sharpe_coeff'] = 0.0
-    agg_df['consistency_score'] = 0.0
-    agg_df['horizons_present'] = 0
+    
+    # Create a DataFrame where columns are horizons and values are pure returns
+    # This correctly handles the input, which is a dictionary of Series
+    pure_returns_across_horizons = pd.concat(stability_results.values(), axis=1, keys=stability_results.keys())
+    
+    # Calculate key stability metrics across the horizons for each factor
+    agg_df['avg_pure_return'] = pure_returns_across_horizons.mean(axis=1)
+    agg_df['std_pure_return'] = pure_returns_across_horizons.std(axis=1)
+    
+    # The "Coefficient Sharpe Ratio" measures signal strength vs. noise across time horizons
+    agg_df['sharpe_ratio_coeff'] = agg_df['avg_pure_return'] / agg_df['std_pure_return'].replace(0, np.nan)
+    
+    # Consistency Score: How often does the signal's sign match the average sign?
+    def calculate_consistency(row):
+        if pd.isna(row['avg_pure_return']) or row['avg_pure_return'] == 0:
+            return 0.0
+        sign_of_avg = np.sign(row['avg_pure_return'])
+        horizon_values = pure_returns_across_horizons.loc[row.name].dropna()
+        if horizon_values.empty:
+            return 0.0
+        same_sign_count = (np.sign(horizon_values) == sign_of_avg).sum()
+        return same_sign_count / len(horizon_values)
 
-    for factor in agg_df.index:
-        sharpes = []
-        for horizon, df in stability_results.items():
-            if factor in df.index:
-                sharpes.append(df.loc[factor, 'sharpe_ratio_coeff'])
-        
-        if not sharpes:
-            continue
-            
-        avg_sharpe = np.mean(sharpes)
-        agg_df.loc[factor, 'avg_sharpe_coeff'] = avg_sharpe
-        agg_df.loc[factor, 'horizons_present'] = len(sharpes)
+    agg_df['consistency_score'] = agg_df.apply(calculate_consistency, axis=1)
 
-        if avg_sharpe != 0:
-            sign_of_avg = np.sign(avg_sharpe)
-            # Count how many individual sharpes have the same sign as the average
-            same_sign_count = sum(1 for s in sharpes if np.sign(s) == sign_of_avg and not np.isclose(s, 0)) # Added np.isclose(s, 0) for robustness
-            agg_df.loc[factor, 'consistency_score'] = same_sign_count / len(sharpes)
-        else:
-            agg_df.loc[factor, 'consistency_score'] = 0.0
-
-    # Calculate Final_Score ensuring non-negative values for weighting
-    agg_df['Final_Score'] = agg_df['avg_sharpe_coeff'].abs() * (agg_df['consistency_score'] ** 2)
+    # Final Score for weighting: rewards high signal-to-noise and high consistency
+    agg_df['Final_Score'] = agg_df['sharpe_ratio_coeff'].abs() * (agg_df['consistency_score'] ** 2)
     agg_df = agg_df.sort_values('Final_Score', ascending=False).fillna(0)
     
     total_score = agg_df['Final_Score'].sum()
@@ -2191,13 +2193,17 @@ def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_
     else:
         agg_df['Final_Weight'] = 0.0
 
+    # Create the final dictionary of weights to be used by the app
     final_weights_dict = {metric: 0.0 for metric in all_metrics}
     for short_name, row in agg_df.iterrows():
         long_name = METRIC_NAME_MAP.get(short_name, short_name)
-        if long_name in all_metrics: # Ensure it maps to a valid metric in default_weights (i.e. all_metrics)
+        if long_name in all_metrics:
             final_weights_dict[long_name] = row['Final_Weight']
             
-    return final_weights_dict, agg_df   
+    # The original function also returned the aggregated rationale dataframe
+    # Let's add the avg_pure_return back into the returned dataframe for display
+    agg_df['avg_sharpe_coeff'] = agg_df['sharpe_ratio_coeff'] # Match column name for UI
+    return final_weights_dict, agg_df  
 
 def calculate_pure_returns(df, characteristics, target='Return_252d', vif_threshold=5, use_pca=True, pca_variance_threshold=0.95):
     """
