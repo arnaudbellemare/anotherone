@@ -35,9 +35,7 @@ from plotly.subplots import make_subplots
 # --- Basic Configuration ---
 logging.basicConfig(filename='stock_analysis.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 st.set_page_config(page_title="Quantitative Portfolio Analysis", layout="wide")
-RANDOM_SEED = 42
-random.seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
+
 # --- Data Structures and Mappings ---
 sector_etf_map = {
     'Technology': 'XLK', 'Consumer Cyclical': 'XLY', 'Communication Services': 'XLC',
@@ -146,62 +144,7 @@ REVERSE_METRIC_NAME_MAP = {v: k for k, v in METRIC_NAME_MAP.items()}
 ################################################################################
 # SECTION 1: ALL FUNCTION DEFINITIONS
 ################################################################################
-def display_theoretical_background():
-    """
-    Displays explanations of the quantitative concepts used in the application.
-    """
-    st.header("📜 Theoretical Background & Methodology")
-    st.info("This section explains the 'why' behind the quantitative techniques used in this tool to build a robust factor model. These concepts are drawn from institutional quantitative finance.")
 
-    st.subheader("Key Goal: Improving the Information Coefficient (IC)")
-    st.write("""
-    The **Information Coefficient (IC)** is the cornerstone of factor investing. It measures the correlation between a factor's prediction (e.g., ranking stocks by a 'Value' score) and the actual outcome (e.g., their future returns). A high and stable IC means the factor is a reliable predictor. The entire model is designed to find, weigh, and combine factors in a way that maximizes the portfolio's effective IC.
-    """)
-
-    # --- Accordion for detailed concepts ---
-    with st.expander("Enhancing Factor Signals (Transform & Combine)"):
-        st.markdown("#### Transform Factors")
-        st.markdown("""
-        *   **Concept:** Raw factor data (like Market Cap) can have extreme outliers that distort analysis. Applying transformations normalizes the data's distribution, ensuring that ranks capture meaningful differences rather than just noise from extreme values.
-        *   **Implementation (`calculate_pure_returns`):**
-            *   **Log Transformation:** For factors with large positive values (e.g., Market Cap), a `log1p` transform is applied to compress the scale.
-            *   **Robust Scaling:** Instead of a standard Z-score (which is sensitive to outliers), the `RobustScaler` is used. It centers data using the median and scales it using the interquartile range, making the transformation highly resistant to extreme data points.
-        """)
-
-        st.markdown("#### Combine Factors")
-        st.markdown("""
-        *   **Concept:** A single factor is rarely perfect. By creating a composite score from a weighted average of multiple factor *ranks*, we build a more stable and consistent signal. This diversification at the factor level often improves the overall model's IC.
-        *   **Implementation (Scoring block in `main`):** The final `Score` for each stock is not based on a single metric. It's a weighted sum of its percentile ranks across all the factors chosen by the stability analysis. This creates a robust, multi-faceted composite alpha factor.
-        """)
-
-    with st.expander("Isolating Pure Alpha (Factor Classification)"):
-        st.markdown("#### Neutralize Exposures to Isolate Pure Signals")
-        st.markdown("""
-        *   **Concept:** A simple factor is often contaminated by other unintended exposures. For example, a "Value" factor might be heavily biased towards financial stocks. Is the factor working because value is being rewarded, or simply because financials are having a good run? To find out, we must neutralize these exposures.
-        *   **Implementation (`calculate_pure_returns`):** This is one ofthe most critical steps. By running a cross-sectional multiple regression of stock returns against *all* factors simultaneously, the model calculates each factor's **pure return**. The regression coefficient for "Value" represents its contribution to returns *after controlling for the effects of sector, size, momentum, and all other factors in the model*. This isolates the true, pure alpha signal of each factor.
-        """)
-
-        st.markdown("#### Dynamic Classification & Weighting")
-        st.markdown("""
-        *   **Concept:** Not all factors work well in all market conditions. A truly robust model must dynamically adjust which factors it relies on. Instead of a simple "on/off" switch based on a regime, we can measure a factor's long-term performance and consistency.
-        *   **Implementation (`run_factor_stability_analysis`):** The model does not use static, predefined weights. It performs a historical analysis to calculate the time-series of each factor's pure return. It then calculates the **Sharpe Ratio of these factor returns**. This "Coefficient Sharpe Ratio" is a powerful measure of a factor's historical risk-adjusted performance and consistency. Factors with high and stable Sharpe Ratios receive higher weights in the final model. This is a direct, data-driven implementation of **IC-Based Weighting**.
-        """)
-
-    with st.expander("Ensuring Robustness (Data & Ranking Process)"):
-        st.markdown("#### Clean Data (Winsorization)")
-        st.markdown("""
-        *   **Concept:** Stock returns can have extreme daily jumps that are often noise rather than signal. These outliers can dramatically skew volatility and correlation calculations, making the model unstable.
-        *   **Implementation (`winsorize_returns`):** The script applies a robust winsorization technique. It doesn't just cap returns at a fixed percentage. Instead, it calculates a score for each return based on how many rolling standard deviations it is from the median, and caps only the most extreme statistical outliers. This cleans the data while preserving the integrity of the underlying distribution.
-        """)
-
-        st.markdown("#### Handle Ties Correctly")
-        st.markdown("""
-        *   **Concept:** When multiple stocks have the exact same factor score, they must be assigned the same rank to maintain statistical integrity.
-        *   **Implementation (Scoring block in `main`):** This is handled automatically and correctly by using the `pandas.DataFrame.rank()` method, which assigns the average rank to all tied elements by default.
-        """)
-
-    st.markdown("---")
-    st.write("By integrating these techniques, the model aims to be robust, adaptive, and based on signals that have been statistically purified and validated through historical analysis.")
 # --- Helper Functions ---
 def calculate_growth(current, previous):
     if pd.isna(current) or pd.isna(previous) or previous == 0: return np.nan
@@ -973,54 +916,29 @@ def plot_factor_exposure_breakdown(portfolio_betas):
 def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     """
     Calculates the portfolio's beta exposure to a set of factors using regression.
-    (CORRECTED to handle non-finite values before fitting the model)
     """
-    # --- STEP 0: Initial checks for empty inputs ---
-    if portfolio_ts.empty or factor_returns_df.empty:
-        logging.warning("calculate_portfolio_factor_betas received empty inputs.")
+    if portfolio_ts.empty or factor_returns_df.empty: # Added robustness checks
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # --- STEP 1: Align the data by finding common dates ---
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
-    
-    if len(common_idx) < 20: # Need enough data points for a meaningful regression
-        logging.warning(f"Insufficient common data ({len(common_idx)}) for factor beta regression.")
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-        
     aligned_portfolio_ts = portfolio_ts.loc[common_idx]
     aligned_factor_returns = factor_returns_df.loc[common_idx]
-
-    # --- STEP 2 (THE CRITICAL FIX): Clean the aligned data ---
-    # `pct_change()` can create `inf` values (division by zero) and `NaN` values (missing data).
-    # Scikit-learn models cannot handle these. We must replace them before fitting.
-    # The standard practice is to replace them with 0.0, implying a neutral return for that period.
-    aligned_portfolio_ts = aligned_portfolio_ts.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    aligned_factor_returns = aligned_factor_returns.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # --- STEP 3: Filter out factor columns with no variance (after cleaning) ---
-    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6]
-
-    if X_filtered.empty:
-        logging.warning("No factors with variance left after cleaning for beta regression.")
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-
-    # --- STEP 4: Fit the Ridge regression model (now safe) with a final safeguard ---
-    try:
-        model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
-    except ValueError as ve: # Catch the specific error if cleaning somehow failed
-        logging.error(f"Ridge regression failed in calculate_portfolio_factor_betas with ValueError: {ve}. This indicates data might still be unclean.")
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-    except Exception as e: # Catch any other unexpected errors
-        logging.error(f"An unexpected error occurred during Ridge regression: {e}")
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-
-    # --- STEP 5: Map coefficients back to original factor columns ---
-    full_betas = pd.Series(0.0, index=factor_returns_df.columns)
     
-    # Use the columns from X_filtered to ensure correct mapping
-    for i, col_name in enumerate(X_filtered.columns):
-        if col_name in full_betas.index:
-            full_betas[col_name] = model.coef_[i]
+    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty or aligned_factor_returns.shape[1] == 0: # Added length check
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+
+    # Filter out columns from aligned_factor_returns that have zero variance
+    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6] # Added filtering
+    
+    if X_filtered.empty: # Added check for empty filtered factors
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+
+    model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
+    
+    # Map coefficients back to original factor_returns_df columns
+    full_betas = pd.Series(0.0, index=factor_returns_df.columns)
+    for i, col in enumerate(X_filtered.columns):
+        full_betas[col] = model.coef_[i]
         
     return full_betas
 
@@ -2056,144 +1974,66 @@ def calculate_relative_carry(results_df):
     results_df = results_df.drop(columns=['Carry_Numeric'])
 
     return results_df
-@st.cache_data(ttl=86400) # Cache the result for 24 hours
-def generate_real_historical_pure_returns(_results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'):
+
+
+# ADD THIS NEW, COMBINED FUNCTION
+def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_metric_map):
     """
-    Generates a REAL history of pure factor returns by iterating backward in time.
-    (CORRECTED to handle the join/merge error)
+    Aggregates stability metrics from multiple time horizons and sets final portfolio weights.
+    This is the deterministic replacement for the simulation-based method.
     """
-    logging.info(f"Starting REAL historical pure returns generation for {steps} steps...")
-    if not _returns_dict:
-        logging.error("Returns dictionary is empty. Cannot generate historical pure returns.")
-        return {h: [] for h in time_horizons}
-
-    # Create a single DataFrame from the returns dictionary
-    returns_df = pd.DataFrame(_returns_dict)
-    
-    # Ensure index is sorted and timezone-naive
-    if not returns_df.index.is_monotonic_increasing:
-        returns_df.sort_index(inplace=True)
-    if returns_df.index.tz is not None:
-        returns_df.index = returns_df.index.tz_localize(None)
-
-    if returns_df.empty:
-        logging.error("Historical returns DataFrame is empty after creation.")
-        return {h: [] for h in time_horizons}
-
-    # --- FIX START: Set the index of results_df to 'Ticker' ONCE before the loop ---
-    if 'Ticker' in _results_df.columns:
-        results_df_indexed = _results_df.set_index('Ticker')
-    else:
-        logging.error("Cannot find 'Ticker' column in results_df for indexing.")
-        return {h: [] for h in time_horizons}
-    # --- FIX END ---
-        
-    end_date = returns_df.index.max()
-    date_range = pd.date_range(end=end_date, periods=steps, freq=f'-1{freq}').tz_localize(None)
-
-    historical_results_by_horizon = {h: [] for h in time_horizons}
-
-    for analysis_date in tqdm(date_range, desc="Analyzing Historical Factor Performance"):
-        for horizon_label, target_col in time_horizons.items():
-            days_forward = int(target_col.split('_')[1][:-1])
-            
-            try:
-                start_idx_loc_arr = returns_df.index.get_indexer([analysis_date], method='nearest')
-                if start_idx_loc_arr[0] == -1:
-                    continue
-                start_idx_loc = start_idx_loc_arr[0]
-            except Exception as e:
-                logging.warning(f"Could not find index location for {analysis_date}: {e}. Skipping.")
-                continue
-
-            end_idx_loc = min(start_idx_loc + days_forward, len(returns_df) - 1)
-            
-            if start_idx_loc >= end_idx_loc:
-                continue
-                
-            start_date = returns_df.index[start_idx_loc]
-            end_date = returns_df.index[end_idx_loc]
-
-            forward_returns = returns_df.loc[start_date:end_date].sum()
-            forward_returns_df = forward_returns.to_frame(name=target_col)
-            
-            # --- FIX START: Use the indexed DataFrame and a standard index-based join ---
-            # This is cleaner and avoids the column overlap error.
-            analysis_df = results_df_indexed.join(forward_returns_df, how='inner')
-            # --- FIX END ---
-            
-            # We no longer need to dropna for the target_col because 'inner' join already handles it
-            
-            if analysis_df.empty or len(analysis_df) < 50:
-                continue
-
-            pure_returns_slice = calculate_pure_returns(analysis_df, valid_metric_cols, target=target_col)
-            
-            if not pure_returns_slice.empty:
-                historical_results_by_horizon[horizon_label].append(pure_returns_slice)
-
-    logging.info("Finished REAL historical pure returns generation.")
-    return historical_results_by_horizon
-
-
-def analyze_coefficient_stability(historical_data):
-    """
-    Analyzes the stability of factor coefficients over time to find the most robust factors.
-    """
-    if not historical_data:
-        return pd.DataFrame()
-
-    # Ensure all series in historical_data have the same index for concatenation
-    # Reindex all to the union of all indices or a common, filtered set
-    all_indices = pd.Index([])
-    for s in historical_data:
-        all_indices = all_indices.union(s.index)
-    
-    # Pad shorter series with NaN if their factor was not present at that time
-    df = pd.concat([s.reindex(all_indices) for s in historical_data], axis=1)
-    df.columns = [f'run_{i}' for i in range(len(df.columns))]
-    
-    stability_metrics = pd.DataFrame(index=df.index)
-    stability_metrics['mean_coeff'] = df.mean(axis=1)
-    stability_metrics['std_coeff'] = df.std(axis=1)
-    
-    # Handle std_coeff being zero to prevent division by zero in Sharpe
-    stability_metrics['sharpe_ratio_coeff'] = stability_metrics['mean_coeff'] / (stability_metrics['std_coeff'].replace(0, np.nan)) # Replaced +1e-6 with replace(0,np.nan)
-    
-    # For pct_positive, we need to handle NaNs correctly. Use .count() as total, not len(df.columns)
-    # as some factors might not be present in all runs.
-    stability_metrics['pct_positive'] = (df > 0).sum(axis=1) / df.count(axis=1).replace(0, np.nan) # Used df.count(axis=1).replace(0, np.nan)
-    stability_metrics['pct_positive'].fillna(0, inplace=True) # Fill NaNs (e.g. if factor was never present)
-
-    # Sort by absolute Sharpe to find most robust factors (positive or negative)
-    return stability_metrics.sort_values(by='sharpe_ratio_coeff', key=abs, ascending=False).fillna(0) # Fill NaNs after sorting for display
-
-def set_weights_from_stability(stability_df, all_metrics, reverse_metric_map):
-    """
-    Sets final portfolio weights based on the factor's stability (Coefficient Sharpe Ratio).
-    """
-    if stability_df.empty or 'sharpe_ratio_coeff' not in stability_df.columns:
+    if not stability_results:
         return {metric: 0.0 for metric in all_metrics}, pd.DataFrame()
 
-    scores = stability_df['sharpe_ratio_coeff'].abs()
-    
-    total_score = scores.sum()
-    if total_score == 0:
-        return {metric: 0.0 for metric in all_metrics}, stability_df # Return zero weights and original df
+    # Collect all factors present across all horizons
+    all_factors = set()
+    for horizon, df in stability_results.items():
+        all_factors.update(df.index)
 
-    final_weights = (scores / total_score) * 100
+    agg_df = pd.DataFrame(index=list(all_factors))
     
+    # Create a DataFrame where columns are horizons and values are pure returns
+    # This forms the basis of our stability analysis
+    pure_returns_across_horizons = pd.concat(stability_results.values(), axis=1, keys=stability_results.keys())
+    
+    # Calculate key stability metrics across the horizons for each factor
+    agg_df['avg_pure_return'] = pure_returns_across_horizons.mean(axis=1)
+    agg_df['std_pure_return'] = pure_returns_across_horizons.std(axis=1)
+    
+    # The "Coefficient Sharpe Ratio" measures signal strength vs. noise across time horizons
+    agg_df['sharpe_ratio_coeff'] = agg_df['avg_pure_return'] / agg_df['std_pure_return'].replace(0, np.nan)
+    
+    # Consistency Score: How often does the signal's sign match the average sign?
+    def calculate_consistency(row):
+        if pd.isna(row['avg_pure_return']) or row['avg_pure_return'] == 0:
+            return 0.0
+        sign_of_avg = np.sign(row['avg_pure_return'])
+        horizon_values = pure_returns_across_horizons.loc[row.name].dropna()
+        if horizon_values.empty:
+            return 0.0
+        same_sign_count = (np.sign(horizon_values) == sign_of_avg).sum()
+        return same_sign_count / len(horizon_values)
+
+    agg_df['consistency_score'] = agg_df.apply(calculate_consistency, axis=1)
+
+    # Final Score for weighting: rewards high signal-to-noise and high consistency
+    agg_df['Final_Score'] = agg_df['sharpe_ratio_coeff'].abs() * (agg_df['consistency_score'] ** 2)
+    agg_df = agg_df.sort_values('Final_Score', ascending=False).fillna(0)
+    
+    total_score = agg_df['Final_Score'].sum()
+    if total_score > 0:
+        agg_df['Final_Weight'] = (agg_df['Final_Score'] / total_score) * 100
+    else:
+        agg_df['Final_Weight'] = 0.0
+
+    # Create the final dictionary of weights to be used by the app
     final_weights_dict = {metric: 0.0 for metric in all_metrics}
-    for short_name, weight in final_weights.items():
+    for short_name, row in agg_df.iterrows():
         long_name = METRIC_NAME_MAP.get(short_name, short_name)
-        if long_name in all_metrics: # Ensure that `long_name` is one of the keys in `default_weights` (which `all_metrics` is based on)
-            final_weights_dict[long_name] = weight
+        if long_name in all_metrics:
+            final_weights_dict[long_name] = row['Final_Weight']
             
-    # Add 'Final_Weight' to stability_df based on short_name (its index)
-    stability_df['Final_Weight'] = final_weights
-    stability_df.fillna(0, inplace=True) # This inplace is safe
-    
-    return final_weights_dict, stability_df
+    return final_weights_dict, agg_df
 
 def check_multicollinearity(X, characteristics, vif_threshold=10):
     if X.empty or X.shape[1] < 2: return characteristics
@@ -2431,87 +2271,35 @@ def calculate_pure_returns(df, characteristics, target='Return_252d', vif_thresh
         return pd.Series(dtype=float, name="PureReturns")
 # We will use a simplified vol calculation here for demonstration.
 
-# --- Helper functions for robust volatility (add these to your script) ---
-BUSINESS_DAYS_IN_YEAR = 252 # Common assumption for financial calculations
-
-def resample_prices_to_business_day_index(price: pd.Series) -> pd.Series:
+def calculate_ewma_volatility(returns_series, span=63, annualize=True):
     """
-    Resamples a price series to a daily (business day) frequency, forward-filling NaNs.
-    Assumes `price` series has a DatetimeIndex.
-    """
-    if price.empty:
-        return price
-    if not isinstance(price.index, pd.DatetimeIndex):
-        price.index = pd.to_datetime(price.index)
-    return price.resample('B').ffill().dropna()
-
-def simple_ewvol_calc(
-    daily_returns: pd.Series, days: int = 35, min_periods: int = 10, **ignored_kwargs
-) -> pd.Series:
-    if daily_returns.empty or len(daily_returns.dropna()) < min_periods:
-        return pd.Series(np.nan, index=daily_returns.index)
-    vol = daily_returns.ewm(adjust=True, span=days, min_periods=min_periods).std()
-    return vol
-
-def apply_min_vol(vol: pd.Series, vol_abs_min: float = 0.0000000001) -> pd.Series:
-    if vol.empty: return pd.Series(dtype=float)
-    temp_vol = vol.copy()
-    temp_vol[temp_vol < vol_abs_min] = vol_abs_min
-    return temp_vol
-
-def apply_vol_floor(
-    vol: pd.Series,
-    floor_min_quant: float = 0.05,
-    floor_min_periods: int = 100,
-    floor_days: int = 500,
-) -> pd.Series:
-    if vol.empty: return pd.Series(dtype=float)
-    vol_min = vol.rolling(window=floor_days, min_periods=floor_min_periods).quantile(q=floor_min_quant)
-    if not vol_min.empty:
-        vol_min = vol_min.fillna(0.0).ffill()
-    else:
-        return vol
-    vol_floored = np.maximum(vol, vol_min)
-    return vol_floored
-
-def backfill_vol(vol: pd.Series) -> pd.Series:
-    if vol.empty: return pd.Series(dtype=float)
-    vol_forward_fill = vol.ffill()
-    vol_backfilled = vol_forward_fill.bfill()
-    return vol_backfilled
-
-# --- MODIFIED `calculate_ewma_volatility` FUNCTION ---
-# This is the function you should replace.
-def calculate_ewma_volatility(returns_series: pd.Series, span: int = 35, annualize: bool = True):
-    """
-    Calculates a robust, exponential volatility. This function replaces the simpler
-    EWMA volatility calculation with a more advanced version that handles floors and minimums.
-
+    Calculates Exponentially Weighted Moving Average (EWMA) volatility.
+    
     Args:
         returns_series (pd.Series): Daily percentage returns.
-        span (int): The number of days in lookback for EWMA.
+        span (int): The span for the EWMA calculation (e.g., 63 for approx 3 months).
         annualize (bool): Whether to annualize the volatility.
-
+        
     Returns:
-        pd.Series: Robustly calculated conditional volatility.
+        pd.Series: EWMA conditional volatility.
     """
-    if returns_series.empty or returns_series.isnull().all():
+    if returns_series.empty or len(returns_series.dropna()) < 2:
         return pd.Series(np.nan, index=returns_series.index)
-
-    # Core robust calculation using the helper functions
-    vol = simple_ewvol_calc(returns_series, days=span, min_periods=int(span/3))
-    if vol.empty:
-        return pd.Series(np.nan, index=returns_series.index)
-
-    vol = apply_min_vol(vol)
-    vol = apply_vol_floor(vol, floor_days=252, floor_min_periods=100) # Use reasonable defaults
-    vol = backfill_vol(vol)
-
+    
+    # Square the returns to get daily variances
+    squared_returns = returns_series.dropna()**2
+    
+    # Calculate EWMA of squared returns to get conditional variance
+    ewma_variance = squared_returns.ewm(span=span, adjust=False).mean()
+    
+    # Take the square root to get conditional volatility
+    ewma_vol = np.sqrt(ewma_variance)
+    
     if annualize:
-        vol *= np.sqrt(BUSINESS_DAYS_IN_YEAR)
-
-    # Reindex to ensure the final series has the same index as the input
-    return vol.reindex(returns_series.index, method='ffill').bfill()
+        ewma_vol *= np.sqrt(252) # Annualize daily volatility
+        
+    # Reindex to original returns series to maintain length, filling initial NaNs
+    return ewma_vol.reindex(returns_series.index, method='ffill').bfill()
 
 
 @lru_cache(maxsize=1024)
@@ -2774,51 +2562,52 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
             results_df[col] += np.random.normal(0, 0.01, len(results_df))
     
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
+# REPLACE THE BODY of run_factor_stability_analysis with this new logic
 @st.cache_data
-def run_factor_stability_analysis(_results_df, _returns_dict, _all_possible_metrics, _reverse_metric_map):
+def run_factor_stability_analysis(_results_df, _all_possible_metrics, _reverse_metric_map):
     """
-    Encapsulates the entire computationally expensive factor stability analysis
-    into a single, cacheable function. This version uses a REAL historical
-    analysis instead of a simulation.
+    Encapsulates the entire computationally expensive factor stability analysis 
+    into a single, cacheable function. This version is deterministic and stable.
     """
     time_horizons = {
         "1W": "Return_5d", "2W": "Return_10d", "1M": "Return_21d",
         "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d",
     }
     
-    # Filter out metrics that are not numeric or are "Score" related
-    valid_metric_cols = [
-        c for c in _results_df.columns if pd.api.types.is_numeric_dtype(_results_df[c])
-        and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']
-    ]
+    valid_metric_cols = [c for c in _results_df.columns if pd.api.types.is_numeric_dtype(_results_df[c]) and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']]
     
-    stability_results = {}
+    # Instead of simulating, we collect the actual pure returns for each horizon
+    pure_returns_by_horizon = {}
 
-    logging.info("Starting cached factor stability analysis with REAL historical data...")
+    logging.info("Starting deterministic factor stability analysis...")
+    for horizon_label, target_column in time_horizons.items():
+        if target_column in _results_df.columns:
+            logging.info(f"Calculating pure returns for {horizon_label} horizon...")
+            
+            # Calculate pure returns for this specific time horizon
+            pure_returns_today = calculate_pure_returns(_results_df, valid_metric_cols, target=target_column)
+            
+            if not pure_returns_today.empty:
+                # Store the resulting Series in our dictionary
+                pure_returns_by_horizon[horizon_label] = pure_returns_today
+            else:
+                logging.warning(f"Pure returns calculation failed for {horizon_label}, skipping.")
     
-    # --- THIS IS THE KEY CHANGE ---
-    # Call the new function to get a real history for all horizons at once.
-    # We pass the winsorized log returns here.
-    historical_pure_returns_by_horizon = generate_real_historical_pure_returns(
-        _results_df, _returns_dict, time_horizons, valid_metric_cols, steps=36, freq='M'
-    )
-    # --- END OF KEY CHANGE ---
-
-    # Now, process the real historical results
-    for horizon_label, historical_runs in historical_pure_returns_by_horizon.items():
-        if historical_runs:
-            logging.info(f"Analyzing stability for {horizon_label} horizon with {len(historical_runs)} historical data points.")
-            stability_df = analyze_coefficient_stability(historical_runs)
-            stability_results[horizon_label] = stability_df
-        else:
-            logging.warning(f"No valid historical pure returns generated for {horizon_label}, skipping stability analysis.")
-    
-    logging.info("Aggregating stability results from real historical analysis...")
+    logging.info("Aggregating stability results across all horizons...")
+    # Pass the dictionary of real pure returns to the new aggregation function
     auto_weights, rationale_df = aggregate_stability_and_set_weights(
-        stability_results, _all_possible_metrics, _reverse_metric_map
+        pure_returns_by_horizon, _all_possible_metrics, _reverse_metric_map
     )
     
-    return auto_weights, rationale_df, stability_results
+    # We now pass back the original dictionary to be displayed in the UI expander
+    # This lets the user see the raw data for each horizon
+    stability_results_for_display = {
+        horizon: returns.to_frame('Pure_Return')
+        for horizon, returns in pure_returns_by_horizon.items()
+    }
+
+    return auto_weights, rationale_df, stability_results_for_display
+
 # The user's provided `robust_vol_calc` is more sophisticated and could be swapped in.
 @st.cache_data
 def get_all_prices_and_vols(_tickers, _returns_dict):
@@ -3989,8 +3778,6 @@ def main():
             results_df['CS_Mean_Reversion'] = np.nan # Ensure column exists if it was to be used
     st.success("Advanced signals generated.")
 
-# In main()
-
     # --- Automatic Factor Weighting ---
     st.sidebar.subheader("Factor Weighting")
     active_weights = default_weights # Initialize with defaults
@@ -3999,28 +3786,24 @@ def main():
     
     # Macro regime analysis is displayed later in Tab 3, but no longer impacts weights directly here.
     
+    # ... inside main() ...
     with st.spinner("Analyzing stability of all factors (incl. advanced)..."):
         all_possible_metrics = list(default_weights.keys())
-        
-        # Call the function to get a real history for all horizons at once.
+        # THIS FUNCTION CALL STAYS THE SAME, BUT ITS INTERNALS ARE NEW
         auto_weights, rationale_df, stability_results = run_factor_stability_analysis(
-            results_df, winsorized_returns_dict, all_possible_metrics, REVERSE_METRIC_NAME_MAP
+            results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
         )
         
-        # --- THIS IS THE CORRECTED BLOCK ---
-        # There should only be ONE if/else statement here.
         if not rationale_df.empty:
             rationale_df['Signal Direction'] = np.where(rationale_df['avg_sharpe_coeff'] >= 0, 'Positive ✅', 'Inverted 🔄')
-            active_weights = auto_weights
-            active_rationale = rationale_df
+            active_weights = auto_weights # Use auto_weights directly, no regime adjustment
+            active_rationale = rationale_df # Update active_rationale
         else:
             st.warning("Factor stability analysis failed, using default weights.")
-            active_weights = default_weights
-            active_rationale = pd.DataFrame()
-        # --- END OF CORRECTION ---
+            active_weights = default_weights # Fallback if stability analysis fails
+            active_rationale = pd.DataFrame() # Ensure it's empty
 
     if not active_rationale.empty:
-        # ... the rest of your main function continues here ...
         with st.sidebar.expander("View Factor Model Rationale", expanded=True):
             display_rationale = active_rationale[['avg_sharpe_coeff', 'consistency_score', 'Signal Direction']].copy()
             display_rationale['Final_Weight'] = display_rationale.index.map(lambda short_name: active_weights.get(METRIC_NAME_MAP.get(short_name, short_name), 0.0))
@@ -4555,34 +4338,28 @@ def main():
         else:
             st.warning("No stocks available in the portfolio to display a dashboard.")
 
-    # --- Populate Tab 2: Factor Analysis (Context is portfolio-level) ---
-    with tab2:
-        st.subheader("Pure Factor Returns (Aggregated & Individual Horizons)")
-        st.write("These are the underlying factor returns calculated across the entire stock universe.")
+    # --- Populate Tab 2: Factor Analysis (Context is portfolio-level) --
+    with tab2: # This is the Factor Analysis Tab
+        st.subheader("Factor Weighting Rationale (Aggregated)")
+        st.write("This table shows the final aggregated scores and weights for each factor, derived from analyzing performance across multiple time horizons.")
         if not active_rationale.empty:
+            # Display the main rationale table (this part is likely already correct)
             st.dataframe(active_rationale)
         else:
             st.info("Factor rationale not available (Factor Stability Analysis failed).")
         
+        # --- THIS IS THE MODIFIED PART FOR THE EXPANDER ---
+        st.subheader("Pure Factor Returns (By Individual Horizon)")
+        st.write("These are the underlying raw factor returns calculated for each time horizon. The table above aggregates these results.")
         if stability_results: 
-            time_horizons_display = {
-                "1W": "Return_5d",   
-                "2W": "Return_10d",  
-                "1M": "Return_21d",  
-                "3M": "Return_63d",  
-                "6M": "Return_126d", 
-                "12M": "Return_252d", 
-            }
-            for horizon_label, target_col_short_name in time_horizons_display.items():
-                stability_df = stability_results.get(horizon_label) 
-                if stability_df is not None and not stability_df.empty:
-                    display_name = METRIC_NAME_MAP.get(target_col_short_name, target_col_short_name)
-                    with st.expander(f"Details for {horizon_label} Horizon (Target: {display_name})"):
-                        st.dataframe(stability_df)
+            for horizon_label, horizon_df in stability_results.items():
+                if horizon_df is not None and not horizon_df.empty:
+                    with st.expander(f"Details for {horizon_label} Horizon"):
+                        st.dataframe(horizon_df.sort_values('Pure_Return', key=abs, ascending=False))
                 else:
                     st.info(f"No significant factors found for {horizon_label} horizon or data missing.")
         else:
-            st.info("Factor stability analysis results are not available.")
+            st.info("Factor stability analysis results are not available to display by horizon.")
 
     # --- Populate Tab 3: Financial Turbulence (This is a macro analysis) ---
     with tab3:
