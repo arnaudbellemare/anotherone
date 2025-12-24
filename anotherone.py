@@ -2035,26 +2035,91 @@ def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_
             
     return final_weights_dict, agg_df
 
-def check_multicollinearity(X, characteristics, vif_threshold=10):
-    if X.empty or X.shape[1] < 2: return characteristics
-    X_clean = X.copy().replace([np.inf, -np.inf], np.nan).fillna(X.median())
-    non_zero_var_cols = [col for col in X_clean.columns if X_clean[col].var() > 1e-8]
-    X_clean = X_clean[non_zero_var_cols]
-    characteristics = [c for c in characteristics if c in non_zero_var_cols]
-    if X_clean.shape[1] < 2: return characteristics
-    corr_matrix = X_clean.corr().abs()
+def check_multicollinearity(X, characteristics, vif_threshold=10.0, corr_threshold=0.99):
+    """
+    Removes highly correlated features and features with high VIF.
+    
+    Returns
+    -------
+    list of str
+        Filtered list of characteristics that survived the checks
+    """
+    if X.empty or len(characteristics) == 0:
+        return []
+
+    # Step 0: Make sure we only work with requested characteristics that actually exist
+    valid_chars = [c for c in characteristics if c in X.columns]
+    if not valid_chars:
+        return []
+
+    X = X[valid_chars].copy()
+
+    # Step 1: Replace inf/-inf with NaN and fill NaNs with column median
+    X = X.replace([np.inf, -np.inf], np.nan)
+    
+    # Median fill — but only if column is not completely NaN
+    for col in X.columns:
+        if X[col].notna().sum() > 0:
+            X[col] = X[col].fillna(X[col].median())
+        else:
+            # If column is all NaN → drop it completely
+            X = X.drop(columns=[col])
+
+    if X.empty or X.shape[1] < 2:
+        return []
+
+    # Step 2: Remove columns with near-zero variance
+    stds = X.std()
+    non_constant_cols = stds[stds > 1e-8].index.tolist()
+    X = X[non_constant_cols]
+
+    if X.shape[1] < 2:
+        return non_constant_cols  # at least return what's left
+
+    # Step 3: Remove near-perfectly correlated features (faster than VIF)
+    corr_matrix = X.corr().abs()
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > 0.99)]
-    X_filtered = X_clean.drop(columns=to_drop)
-    characteristics_filtered = [c for c in characteristics if c not in to_drop]
-    if len(characteristics_filtered) < 2: return characteristics_filtered
+    
+    # Find columns to drop (any correlation >= threshold)
+    to_drop_corr = [
+        column for column in upper.columns
+        if (upper[column] >= corr_threshold).any()
+    ]
+
+    X = X.drop(columns=to_drop_corr, errors='ignore')
+
+    if X.shape[1] < 2:
+        return [c for c in non_constant_cols if c not in to_drop_corr]
+
+    # Step 4: VIF calculation — only on remaining features
     try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+        
         vif_data = pd.DataFrame()
-        vif_data["feature"] = X_filtered.columns
-        vif_data["VIF"] = [variance_inflation_factor(X_filtered.values, i) for i in range(len(X_filtered.columns))]
-        high_vif_features = vif_data[vif_data['VIF'] > vif_threshold]['feature'].tolist()
-        return [c for c in characteristics_filtered if c not in high_vif_features]
-    except Exception: return characteristics_filtered
+        vif_data["feature"] = X.columns
+        vif_values = []
+        
+        for i in range(X.shape[1]):
+            try:
+                vif = variance_inflation_factor(X.values, i)
+                vif_values.append(vif)
+            except Exception as e:
+                # Singular matrix, overflow, etc. → treat as very high VIF
+                vif_values.append(1e12)
+                
+        vif_data["VIF"] = vif_values
+        
+        high_vif_features = vif_data[vif_data["VIF"] > vif_threshold]["feature"].tolist()
+        
+        # Final filtered list
+        surviving = [c for c in X.columns if c not in high_vif_features]
+        
+        return surviving
+
+    except Exception as e:
+        # If VIF completely fails (e.g. statsmodels bug, memory issue, singular everything)
+        print(f"VIF calculation failed: {str(e)}. Keeping features after correlation filter only.")
+        return X.columns.tolist()
 
 def calculate_portfolio_factor_correlations(weighted_df, etf_histories, period="3y", min_days=240):
     """
