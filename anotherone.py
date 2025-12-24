@@ -914,6 +914,10 @@ def plot_factor_exposure_breakdown(portfolio_betas):
     )
     return fig
 def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+
     if portfolio_ts.empty or factor_returns_df.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
@@ -921,46 +925,73 @@ def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     if len(common_idx) < 30:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    y = portfolio_ts.loc[common_idx]
-    X = factor_returns_df.loc[common_idx]
+    y = portfolio_ts.loc[common_idx].copy()
+    X = factor_returns_df.loc[common_idx].copy()
 
-    # Drop near-constant columns early
-    X = X.loc[:, X.std() > 1e-7]
-
-    if X.empty:
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-
-    # KILL THE CRASH: Clean NaN/inf aggressively
+    # Clean inf → NaN
     X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.ffill().bfill()                # Handles gaps from holidays/closed markets
-    X = X.fillna(X.median())             # Last resort fill
-    X = X.dropna(axis=1, how='all')      # Drop hopeless columns
 
-    # Final safety check
+    # Fill gaps (holiday/closed market)
+    X = X.ffill().bfill()
+
+    # Median fill
+    X = X.fillna(X.median(numeric_only=True))
+
+    # Drop hopeless columns
+    X = X.dropna(axis=1, how='all')
+
+    # Variance filter
     X = X.loc[:, X.std() > 1e-8]
-    if X.empty:
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Same cleaning on y
-    y = y.replace([np.inf, -np.inf], np.nan)
-    y = y.ffill().bfill().fillna(y.median())
+    # Clean y
+    y = y.replace([np.inf, -np.inf], np.nan).ffill().bfill().fillna(y.median())
 
-    # Align one last time
+    # Final alignment
     common_final = X.index.intersection(y.dropna().index)
     if len(common_final) < 20:
+        print("DEBUG: Too few points after cleaning — falling back to SPY beta only")
+        # Single-factor fallback to SPY if available
+        if 'SPY' in factor_returns_df.columns:
+            spy_ret = factor_returns_df['SPY'].loc[common_idx]
+            if spy_ret.std() > 1e-8:
+                slope = np.corrcoef(y, spy_ret)[0,1] * (y.std() / spy_ret.std()) if spy_ret.std() > 0 else 0.0
+                betas = pd.Series(0.0, index=factor_returns_df.columns)
+                betas['SPY'] = slope
+                return betas
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    X = X.loc[common_final]
-    y = y.loc[common_final]
+    X_final = X.loc[common_final]
+    y_final = y.loc[common_final]
+
+    # If still no columns with variation → fallback
+    if X_final.empty or X_final.shape[1] == 0:
+        print("DEBUG: No valid factors after all cleaning — falling back to SPY beta only")
+        if 'SPY' in factor_returns_df.columns:
+            spy_ret = factor_returns_df['SPY'].loc[common_final]
+            if spy_ret.std() > 1e-8:
+                slope = np.corrcoef(y_final, spy_ret)[0,1] * (y_final.std() / spy_ret.std()) if spy_ret.std() > 0 else 0.0
+                betas = pd.Series(0.0, index=factor_returns_df.columns)
+                betas['SPY'] = slope
+                return betas
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
     try:
-        model = Ridge(alpha=0.1).fit(X, y)
+        model = Ridge(alpha=0.1).fit(X_final, y_final)
         betas = pd.Series(0.0, index=factor_returns_df.columns)
-        for col, coef in zip(X.columns, model.coef_):
+        for col, coef in zip(X_final.columns, model.coef_):
             betas[col] = coef
         return betas
     except Exception as e:
-        print(f"Beta fit still crashed: {str(e)} | X shape: {X.shape} | NaNs: {X.isna().sum().sum()}")
+        print(f"ERROR in Ridge.fit: {str(e)}")
+        print(f"X_final shape: {X_final.shape}, remaining cols: {list(X_final.columns)}")
+        # Still fallback to SPY if possible
+        if 'SPY' in factor_returns_df.columns:
+            spy_ret = factor_returns_df['SPY'].loc[common_final]
+            if spy_ret.std() > 1e-8:
+                slope = np.corrcoef(y_final, spy_ret)[0,1] * (y_final.std() / spy_ret.std()) if spy_ret.std() > 0 else 0.0
+                betas = pd.Series(0.0, index=factor_returns_df.columns)
+                betas['SPY'] = slope
+                return betas
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
