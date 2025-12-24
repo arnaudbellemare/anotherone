@@ -914,19 +914,9 @@ def plot_factor_exposure_breakdown(portfolio_betas):
     )
     return fig
 def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
-    """
-    Calculates portfolio betas to factors with aggressive NaN/inf protection.
-    Returns neutral (zero) betas on any failure instead of crashing.
-    """
-    import numpy as np
-    import pandas as pd
-    from sklearn.linear_model import Ridge
-
-    # Early exit guards
     if portfolio_ts.empty or factor_returns_df.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Align time indices
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
     if len(common_idx) < 30:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
@@ -934,65 +924,43 @@ def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     y = portfolio_ts.loc[common_idx]
     X = factor_returns_df.loc[common_idx]
 
-    # Remove constant / zero-variance columns
-    X = X.loc[:, X.std() > 1e-7]   # slightly more tolerant than 1e-6
-
-    if X.empty or X.shape[1] == 0:
-        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
-
-    # ───────────────────────────────────────────────
-    #  CLEANING BLOCK — this is what fixes your crash
-    # ───────────────────────────────────────────────
-    # 1. Force inf → NaN
-    X = X.replace([np.inf, -np.inf], np.nan)
-
-    # 2. Time-series friendly fill (forward then backward)
-    X = X.ffill().bfill()
-
-    # 3. Median fill remaining gaps (column-wise)
-    X = X.fillna(X.median())
-
-    # 4. Drop columns that are still completely missing
-    X = X.dropna(axis=1, how='all')
-
-    # 5. Final variance filter after filling
-    X = X.loc[:, X.std() > 1e-8]
+    # Drop near-constant columns early
+    X = X.loc[:, X.std() > 1e-7]
 
     if X.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Clean target the same way
+    # KILL THE CRASH: Clean NaN/inf aggressively
+    X = X.replace([np.inf, -np.inf], np.nan)
+    X = X.ffill().bfill()                # Handles gaps from holidays/closed markets
+    X = X.fillna(X.median())             # Last resort fill
+    X = X.dropna(axis=1, how='all')      # Drop hopeless columns
+
+    # Final safety check
+    X = X.loc[:, X.std() > 1e-8]
+    if X.empty:
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+
+    # Same cleaning on y
     y = y.replace([np.inf, -np.inf], np.nan)
     y = y.ffill().bfill().fillna(y.median())
 
-    # Final alignment
+    # Align one last time
     common_final = X.index.intersection(y.dropna().index)
-    if len(common_final) < 30:
+    if len(common_final) < 20:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    X_final = X.loc[common_final]
-    y_final = y.loc[common_final]
+    X = X.loc[common_final]
+    y = y.loc[common_final]
 
-    # ───────────────────────────────────────────────
-    #  Safe fit with try-except
-    # ───────────────────────────────────────────────
     try:
-        model = Ridge(alpha=0.1).fit(X_final, y_final)
-
-        # Reconstruct full beta vector (missing factors = 0 exposure)
+        model = Ridge(alpha=0.1).fit(X, y)
         betas = pd.Series(0.0, index=factor_returns_df.columns)
-        for col, coef in zip(X_final.columns, model.coef_):
+        for col, coef in zip(X.columns, model.coef_):
             betas[col] = coef
-
         return betas
-
     except Exception as e:
-        # Print to logs what went wrong (visible in Streamlit Cloud logs)
-        print(f"Factor beta fit failed after cleaning: {str(e)}")
-        print(f"X_final shape: {X_final.shape}, any NaN? {X_final.isna().any().any()}")
-        print(f"y_final any NaN? {y_final.isna().any()}")
-
-        # Return safe default instead of crashing the app
+        print(f"Beta fit still crashed: {str(e)} | X shape: {X.shape} | NaNs: {X.isna().sum().sum()}")
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
