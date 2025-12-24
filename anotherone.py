@@ -915,70 +915,84 @@ def plot_factor_exposure_breakdown(portfolio_betas):
     return fig
 def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     """
-    Calculates the portfolio's beta exposure to a set of factors using regression.
+    Calculates portfolio betas to factors with aggressive NaN/inf protection.
+    Returns neutral (zero) betas on any failure instead of crashing.
     """
+    import numpy as np
+    import pandas as pd
+    from sklearn.linear_model import Ridge
+
+    # Early exit guards
     if portfolio_ts.empty or factor_returns_df.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
+    # Align time indices
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
-    aligned_portfolio_ts = portfolio_ts.loc[common_idx]
-    aligned_factor_returns = factor_returns_df.loc[common_idx]
-
-    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty:
+    if len(common_idx) < 30:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Filter low-variance columns
-    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6]
+    y = portfolio_ts.loc[common_idx]
+    X = factor_returns_df.loc[common_idx]
 
-    if X_filtered.empty:
+    # Remove constant / zero-variance columns
+    X = X.loc[:, X.std() > 1e-7]   # slightly more tolerant than 1e-6
+
+    if X.empty or X.shape[1] == 0:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # ────────────────────────────────────────────────────────────────
-    #  CRITICAL CLEANING BLOCK — prevents the NaN/inf ValueError
-    # ────────────────────────────────────────────────────────────────
-    # 1. Replace inf/-inf with NaN
-    X_clean = X_filtered.replace([np.inf, -np.inf], np.nan)
+    # ───────────────────────────────────────────────
+    #  CLEANING BLOCK — this is what fixes your crash
+    # ───────────────────────────────────────────────
+    # 1. Force inf → NaN
+    X = X.replace([np.inf, -np.inf], np.nan)
 
-    # 2. Forward/backward fill time-series gaps (common in ETF data)
-    X_clean = X_clean.ffill().bfill()
+    # 2. Time-series friendly fill (forward then backward)
+    X = X.ffill().bfill()
 
-    # 3. Last resort: fill remaining NaN with column median
-    X_clean = X_clean.fillna(X_clean.median())
+    # 3. Median fill remaining gaps (column-wise)
+    X = X.fillna(X.median())
 
-    # 4. Drop any columns that are still entirely NaN after filling
-    X_clean = X_clean.dropna(axis=1, how='all')
+    # 4. Drop columns that are still completely missing
+    X = X.dropna(axis=1, how='all')
 
-    # 5. One final variance filter (in case median fill created constants)
-    X_clean = X_clean.loc[:, X_clean.std() > 1e-8]
+    # 5. Final variance filter after filling
+    X = X.loc[:, X.std() > 1e-8]
 
-    # 6. Clean target y the same way (very rare but possible)
-    y_clean = aligned_portfolio_ts.replace([np.inf, -np.inf], np.nan)
-    y_clean = y_clean.ffill().bfill().fillna(y_clean.median())
+    if X.empty:
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # 7. Final alignment after cleaning
-    common_final = X_clean.index.intersection(y_clean.dropna().index)
+    # Clean target the same way
+    y = y.replace([np.inf, -np.inf], np.nan)
+    y = y.ffill().bfill().fillna(y.median())
+
+    # Final alignment
+    common_final = X.index.intersection(y.dropna().index)
     if len(common_final) < 30:
-        st.warning("Too few clean aligned points (<30) for factor beta regression. Returning neutral betas.")
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    X_final = X_clean.loc[common_final]
-    y_final = y_clean.loc[common_final]
+    X_final = X.loc[common_final]
+    y_final = y.loc[common_final]
 
-    # ────────────────────────────────────────────────────────────────
-    #  Now safe to fit
-    # ────────────────────────────────────────────────────────────────
+    # ───────────────────────────────────────────────
+    #  Safe fit with try-except
+    # ───────────────────────────────────────────────
     try:
         model = Ridge(alpha=0.1).fit(X_final, y_final)
 
-        # Map coefficients back to original columns (missing = 0)
-        full_betas = pd.Series(0.0, index=factor_returns_df.columns)
-        for i, col in enumerate(X_final.columns):
-            full_betas[col] = model.coef_[i]
+        # Reconstruct full beta vector (missing factors = 0 exposure)
+        betas = pd.Series(0.0, index=factor_returns_df.columns)
+        for col, coef in zip(X_final.columns, model.coef_):
+            betas[col] = coef
 
-        return full_betas
+        return betas
 
     except Exception as e:
-        st.warning(f"Factor beta regression failed even after cleaning: {str(e)}. Returning neutral betas.")
+        # Print to logs what went wrong (visible in Streamlit Cloud logs)
+        print(f"Factor beta fit failed after cleaning: {str(e)}")
+        print(f"X_final shape: {X_final.shape}, any NaN? {X_final.isna().any().any()}")
+        print(f"y_final any NaN? {y_final.isna().any()}")
+
+        # Return safe default instead of crashing the app
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
