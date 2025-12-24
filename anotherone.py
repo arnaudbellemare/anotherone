@@ -917,30 +917,69 @@ def calculate_portfolio_factor_betas(portfolio_ts, factor_returns_df):
     """
     Calculates the portfolio's beta exposure to a set of factors using regression.
     """
-    if portfolio_ts.empty or factor_returns_df.empty: # Added robustness checks
+    if portfolio_ts.empty or factor_returns_df.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
     common_idx = portfolio_ts.index.intersection(factor_returns_df.index)
     aligned_portfolio_ts = portfolio_ts.loc[common_idx]
     aligned_factor_returns = factor_returns_df.loc[common_idx]
-    
-    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty or aligned_factor_returns.shape[1] == 0: # Added length check
+
+    if len(aligned_portfolio_ts) < 20 or aligned_factor_returns.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    # Filter out columns from aligned_factor_returns that have zero variance
-    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6] # Added filtering
-    
-    if X_filtered.empty: # Added check for empty filtered factors
+    # Filter low-variance columns
+    X_filtered = aligned_factor_returns.loc[:, aligned_factor_returns.std() > 1e-6]
+
+    if X_filtered.empty:
         return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
-    model = Ridge(alpha=0.1).fit(X_filtered, aligned_portfolio_ts)
-    
-    # Map coefficients back to original factor_returns_df columns
-    full_betas = pd.Series(0.0, index=factor_returns_df.columns)
-    for i, col in enumerate(X_filtered.columns):
-        full_betas[col] = model.coef_[i]
-        
-    return full_betas
+    # ────────────────────────────────────────────────────────────────
+    #  CRITICAL CLEANING BLOCK — prevents the NaN/inf ValueError
+    # ────────────────────────────────────────────────────────────────
+    # 1. Replace inf/-inf with NaN
+    X_clean = X_filtered.replace([np.inf, -np.inf], np.nan)
+
+    # 2. Forward/backward fill time-series gaps (common in ETF data)
+    X_clean = X_clean.ffill().bfill()
+
+    # 3. Last resort: fill remaining NaN with column median
+    X_clean = X_clean.fillna(X_clean.median())
+
+    # 4. Drop any columns that are still entirely NaN after filling
+    X_clean = X_clean.dropna(axis=1, how='all')
+
+    # 5. One final variance filter (in case median fill created constants)
+    X_clean = X_clean.loc[:, X_clean.std() > 1e-8]
+
+    # 6. Clean target y the same way (very rare but possible)
+    y_clean = aligned_portfolio_ts.replace([np.inf, -np.inf], np.nan)
+    y_clean = y_clean.ffill().bfill().fillna(y_clean.median())
+
+    # 7. Final alignment after cleaning
+    common_final = X_clean.index.intersection(y_clean.dropna().index)
+    if len(common_final) < 30:
+        st.warning("Too few clean aligned points (<30) for factor beta regression. Returning neutral betas.")
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
+
+    X_final = X_clean.loc[common_final]
+    y_final = y_clean.loc[common_final]
+
+    # ────────────────────────────────────────────────────────────────
+    #  Now safe to fit
+    # ────────────────────────────────────────────────────────────────
+    try:
+        model = Ridge(alpha=0.1).fit(X_final, y_final)
+
+        # Map coefficients back to original columns (missing = 0)
+        full_betas = pd.Series(0.0, index=factor_returns_df.columns)
+        for i, col in enumerate(X_final.columns):
+            full_betas[col] = model.coef_[i]
+
+        return full_betas
+
+    except Exception as e:
+        st.warning(f"Factor beta regression failed even after cleaning: {str(e)}. Returning neutral betas.")
+        return pd.Series(0.0, index=factor_returns_df.columns, name="Factor Betas")
 
 def get_benchmark_metrics(benchmark_ticker="SPY", period="3y"):
     """
