@@ -4021,7 +4021,7 @@ def main():
     portfolio_returns_df = pd.DataFrame(simple_rets_dict).reindex(columns=top_15_tickers).dropna(how='all')
 
     # Denoised Covariance Matrix (OAS + Spectral Denoising)
-    _, cov_matrix = calculate_sophisticated_covariance_matrix(top_15_tickers, winsorized_returns_dict, window=corr_window)
+    _, cov_matrix = calculate_covariance_matrix(top_15_tickers, winsorized_returns_dict, window=corr_window)
     
     method_map = {"Equal Weight": "equal", "Inverse Volatility": "inv_vol", "Log Log Sharpe Optimized": "log_log_sharpe"}
     p_weights = calculate_weights(portfolio_returns_df, method=method_map.get(weighting_method_ui), cov_matrix=cov_matrix)
