@@ -1114,7 +1114,7 @@ def fetch_etf_history(ticker, period="3y"):
 @st.cache_data
 def fetch_all_etf_histories(_etf_list, period="3y"):
     etf_histories = {}
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         future_to_etf = {executor.submit(fetch_etf_history, etf, period): etf for etf in _etf_list}
         for future in tqdm(as_completed(future_to_etf), total=len(_etf_list), desc="Fetching ETF Histories"):
             etf = future_to_etf[future]
