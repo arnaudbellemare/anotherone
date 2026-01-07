@@ -1,5 +1,5 @@
 import streamlit as st
-import pandas as pd
+import pandas as pd 
 import numpy as np
 import yfinance as yf
 from datetime import datetime
@@ -2682,49 +2682,89 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
 # REPLACE THE BODY of run_factor_stability_analysis with this new logic
 @st.cache_data
-def run_factor_stability_analysis(_results_df, _all_possible_metrics, _reverse_metric_map):
+def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
     """
-    Encapsulates the entire computationally expensive factor stability analysis 
-    into a single, cacheable function. This version is deterministic and stable.
+    Advanced Factor Weighting Engine:
+    1. Multi-Horizon IC Extraction (Pure Alpha)
+    2. Factor-to-Factor Correlation Pruning (Orthogonalization)
+    3. Bayesian Shrinkage (Prior toward Equal Weight)
+    4. Diversification-Adjusted Final Weighting
     """
     time_horizons = {
-        "1W": "Return_5d", "2W": "Return_10d", "1M": "Return_21d",
-        "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d",
+        "1W": "Return_5d", "1M": "Return_21d",
+        "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d"
     }
     
-    valid_metric_cols = [c for c in _results_df.columns if pd.api.types.is_numeric_dtype(_results_df[c]) and 'Return' not in c and c not in ['Ticker', 'Name', 'Score']]
+    # 1. Extract Factor Characteristics (Short Names)
+    valid_chars = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c]) 
+                   and 'Return' not in c and c not in ['Ticker', 'Name', 'Score', 'Sector']]
     
-    # Instead of simulating, we collect the actual pure returns for each horizon
-    pure_returns_by_horizon = {}
+    # 2. Compute Raw Factor ICs across all horizons
+    horizon_ics = {}
+    for label, target in time_horizons.items():
+        if target in results_df.columns:
+            # calculate_pure_returns returns a Series of Spearman ICs
+            ics = calculate_pure_returns(results_df, valid_chars, target=target)
+            if not ics.empty:
+                horizon_ics[label] = ics
 
-    logging.info("Starting deterministic factor stability analysis...")
-    for horizon_label, target_column in time_horizons.items():
-        if target_column in _results_df.columns:
-            logging.info(f"Calculating pure returns for {horizon_label} horizon...")
-            
-            # Calculate pure returns for this specific time horizon
-            pure_returns_today = calculate_pure_returns(_results_df, valid_metric_cols, target=target_column)
-            
-            if not pure_returns_today.empty:
-                # Store the resulting Series in our dictionary
-                pure_returns_by_horizon[horizon_label] = pure_returns_today
-            else:
-                logging.warning(f"Pure returns calculation failed for {horizon_label}, skipping.")
-    
-    logging.info("Aggregating stability results across all horizons...")
-    # Pass the dictionary of real pure returns to the new aggregation function
-    auto_weights, rationale_df = aggregate_stability_and_set_weights(
-        pure_returns_by_horizon, _all_possible_metrics, _reverse_metric_map
-    )
-    
-    # We now pass back the original dictionary to be displayed in the UI expander
-    # This lets the user see the raw data for each horizon
-    stability_results_for_display = {
-        horizon: returns.to_frame('Pure_Return')
-        for horizon, returns in pure_returns_by_horizon.items()
-    }
+    if not horizon_ics:
+        return {m: 0.0 for m in all_metrics}, pd.DataFrame(), {}
 
-    return auto_weights, rationale_df, stability_results_for_display
+    # 3. Aggregate Stability Metrics
+    ic_panel = pd.concat(horizon_ics.values(), axis=1, keys=horizon_ics.keys())
+    
+    agg_df = pd.DataFrame(index=ic_panel.index)
+    agg_df['avg_ic'] = ic_panel.mean(axis=1)
+    agg_df['std_ic'] = ic_panel.std(axis=1)
+    agg_df['ic_ir'] = agg_df['avg_ic'] / agg_df['std_ic'].replace(0, np.nan)
+    
+    # Consistency Score (Percentage of horizons where IC has the same sign as average)
+    agg_df['consistency'] = ic_panel.apply(lambda x: (np.sign(x) == np.sign(agg_df.loc[x.name, 'avg_ic'])).mean(), axis=1)
+
+    # 4. --- ADVANCED: Factor Correlation Adjustment ---
+    # We must dampen factors that are highly correlated to prevent "over-betting" on a single theme
+    factor_data = results_df[valid_chars].fillna(results_df[valid_chars].median())
+    try:
+        # Use Ledoit-Wolf for a stable Factor-to-Factor correlation matrix
+        f_cov = LedoitWolf().fit(factor_data).covariance_
+        f_vols = np.sqrt(np.diag(f_cov))
+        f_corr = f_cov / np.outer(f_vols, f_vols)
+        f_corr_df = pd.DataFrame(f_corr, index=valid_chars, columns=valid_chars)
+        
+        # Calculate 'Crowding Penalty': Sum of absolute correlations with other factors
+        # A factor that is 0.9 correlated with 5 others gets penalized more
+        crowding_penalty = f_corr_df.abs().sum() 
+        agg_df['redundancy_multiplier'] = 1 / crowding_penalty
+    except:
+        agg_df['redundancy_multiplier'] = 1.0
+
+    # 5. --- ADVANCED: Bayesian Shrinkage ---
+    # We shrink the 'Raw Score' toward an Equal Weight Prior
+    # This assumes that unless a factor is OVERWHELMINGLY stable, it shouldn't deviate far from average
+    raw_score = agg_df['ic_ir'].abs() * agg_df['consistency'] * agg_df['redundancy_multiplier']
+    
+    shrinkage_factor = 0.5 # 0.5 = 50% data, 50% prior
+    prior_score = raw_score.mean() if not raw_score.empty else 0
+    shrunk_score = (shrinkage_factor * prior_score) + ((1 - shrinkage_factor) * raw_score)
+    
+    agg_df['Final_Score'] = shrunk_score.fillna(0)
+    
+    # 6. Final Weight Normalization
+    total_score = agg_df['Final_Score'].sum()
+    if total_score > 0:
+        agg_df['Final_Weight'] = (agg_df['Final_Score'] / total_score) * 100
+    else:
+        agg_df['Final_Weight'] = 0.0
+
+    # Map back to Long Names
+    final_weights_dict = {metric: 0.0 for metric in all_metrics}
+    for short_name, row in agg_df.iterrows():
+        long_name = METRIC_NAME_MAP.get(short_name, short_name)
+        if long_name in all_metrics:
+            final_weights_dict[long_name] = row['Final_Weight']
+            
+    return final_weights_dict, agg_df, horizon_ics
 
 # The user's provided `robust_vol_calc` is more sophisticated and could be swapped in.
 @st.cache_data
