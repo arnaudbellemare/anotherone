@@ -3900,13 +3900,13 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
-    # --- UI Controls ---
+    # --- 1. UI Controls ---
     st.sidebar.subheader("Portfolio Construction")
     weighting_method_ui = st.sidebar.selectbox(
         "Portfolio Weighting Method",
         ["Equal Weight", "Inverse Volatility", "Log Log Sharpe Optimized"]
     )
-    corr_window = st.sidebar.slider("Correlation Window (days)", 30, 180, 90, 30)
+    corr_window = st.sidebar.slider("Correlation Window (days)", 30, 252, 90, 30)
     
     st.sidebar.subheader("🛡️ Portfolio Hedging")
     hedge_risks = st.sidebar.multiselect(
@@ -3920,218 +3920,118 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-    # --- Data Fetching and Initial Processing ---
-    with st.spinner("Fetching ETF and Macroeconomic histories..."):
+    # --- 2. Data Fetching and Initial Processing ---
+    with st.spinner("Fetching histories and processing universe..."):
         etf_histories = fetch_all_etf_histories(etf_list)
-        macro_data = fetch_macro_data() # Fetch macro data, but it won't be used for weight adjustments now
-    st.success("All historical data loaded.")
-
-    with st.spinner(f"Processing {len(tickers)} tickers..."):
+        macro_data = fetch_macro_data()
         results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
 
     if results_df.empty:
         st.error("Fatal Error: No tickers could be processed."); st.stop()
-    st.success(f"Successfully processed {len(results_df)} tickers.")
-    if failed_tickers:
-        st.expander("Show Failed Tickers").warning(f"{len(failed_tickers)} tickers failed: {', '.join(failed_tickers)}")
 
-    # --- CORRECTED ORDER OF OPERATIONS ---
-    # 1. First, we must clean the raw returns.
-    with st.spinner("Applying Winsorization to clean return data..."):
+    # --- 3. Data Cleaning & Advanced Signals ---
+    with st.spinner("Applying Winsorization and Generating Advanced Signals..."):
+        # Winsorize log returns for signal stability
         winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
-    st.success("Return data cleaned successfully.")
-
-    # 2. Now, with clean returns, we can generate advanced signals.
-    with st.spinner("Generating advanced signals (Carry, Mean Reversion)..."):
+        
+        # Calculate Carry (Yields)
         results_df = calculate_relative_carry(results_df)
-        if winsorized_returns_dict: # Check if winsorized_returns_dict is not empty
+        
+        # Calculate Cross-Sectional Mean Reversion
+        if winsorized_returns_dict:
             normalized_prices = get_all_prices_and_vols(list(winsorized_returns_dict.keys()), winsorized_returns_dict)
             results_df = calculate_cs_mean_reversion(results_df, normalized_prices)
         else:
-            st.warning("Winsorized returns dictionary is empty. Skipping normalized price and CS Mean Reversion calculations.")
-            results_df['CS_Mean_Reversion'] = np.nan # Ensure column exists if it was to be used
-    st.success("Advanced signals generated.")
+            results_df['CS_Mean_Reversion'] = 0.0
 
-    # --- Automatic Factor Weighting ---
+    # --- 4. EXECUTE SOPHISTICATED FACTOR ANALYSIS ---
     st.sidebar.subheader("Factor Weighting")
-    active_weights = default_weights # Initialize with defaults
-    active_rationale = pd.DataFrame() # Initialize as empty
-    stability_results = None # Initialize stability_results
-    
-    # Macro regime analysis is displayed later in Tab 3, but no longer impacts weights directly here.
-    
-    # ... inside main() ...
-    with st.spinner("Analyzing stability of all factors (incl. advanced)..."):
-        all_possible_metrics = list(default_weights.keys())
-        # THIS FUNCTION CALL STAYS THE SAME, BUT ITS INTERNALS ARE NEW
-        auto_weights, rationale_df, stability_results = run_factor_stability_analysis(
-            results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
-        )
-        
-        if not rationale_df.empty:
-            rationale_df['Signal Direction'] = np.where(rationale_df['avg_sharpe_coeff'] >= 0, 'Positive ✅', 'Inverted 🔄')
-            active_weights = auto_weights # Use auto_weights directly, no regime adjustment
-            active_rationale = rationale_df # Update active_rationale
-        else:
-            st.warning("Factor stability analysis failed, using default weights.")
-            active_weights = default_weights # Fallback if stability analysis fails
-            active_rationale = pd.DataFrame() # Ensure it's empty
-
-    if not active_rationale.empty:
-        with st.sidebar.expander("View Factor Model Rationale", expanded=True):
-            display_rationale = active_rationale[['avg_sharpe_coeff', 'consistency_score', 'Signal Direction']].copy()
-            display_rationale['Final_Weight'] = display_rationale.index.map(lambda short_name: active_weights.get(METRIC_NAME_MAP.get(short_name, short_name), 0.0))
-            st.dataframe(display_rationale.loc[display_rationale['Final_Weight'] > 0.1].sort_values('Final_Weight', ascending=False), use_container_width=True)
-    
-    user_weights = active_weights # user_weights now reflect all-weather adjustments (or defaults)
     with st.spinner("Executing Sophisticated Factor Analysis..."):
         all_possible_metrics = list(default_weights.keys())
         
-        # Note: In your code you might have named it run_factor_stability_analysis 
-        # or run_sophisticated_factor_analysis. Use whichever name matches the function you pasted.
-        auto_weights, rationale_df, horizon_details = run_sophisticated_factor_analysis(
+        # Call the Bayesian/OAS factor stability engine
+        auto_weights, rationale_df, horizon_details = run_factor_stability_analysis(
             results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
         )
         
         if not rationale_df.empty:
-            # We use try/except because if you only have 1 or 2 factors, qcut will fail
+            # UI Direction label
+            rationale_df['Signal Direction'] = np.where(rationale_df['avg_ic'] >= 0, 'Positive ✅', 'Inverted 🔄')
             try:
+                # Rank factors by Sophistication (Information Ratio of IC)
                 rationale_df['Alpha Quality'] = pd.qcut(rationale_df['ic_ir'].abs(), 3, labels=["Bronze", "Silver", "Gold"])
             except:
                 rationale_df['Alpha Quality'] = "Gold"
                 
             active_weights = auto_weights
-            active_rationale = rationale_df    
-    # --- Scoring Block (Unconstrained Pure Alpha) ---
-    alpha_score = pd.Series(0.0, index=results_df.index)
-    
-    # Create a DataFrame mapping factor short name to its definitive average signal direction
-    if not active_rationale.empty:
-        signal_directions = active_rationale['avg_pure_return'].fillna(0)
-    else:
-        signal_directions = pd.Series(0.0) # Default to 0 if rationale is missing
+            active_rationale = rationale_df
+        else:
+            active_weights = default_weights
+            active_rationale = pd.DataFrame()
 
-    if not results_df.empty and user_weights:
-        for long_name, weight in user_weights.items():
+    # --- 5. SIDEBAR RATIONALE DISPLAY ---
+    if not active_rationale.empty:
+        with st.sidebar.expander("View Factor Model Rationale", expanded=True):
+            try:
+                display_cols = ['ic_ir', 'consistency', 'Signal Direction', 'Alpha Quality']
+                display_df = active_rationale[display_cols].copy()
+                display_df.columns = ['Alpha Sharpe', 'Stability', 'Direction', 'Tier']
+                display_df['Weight %'] = active_rationale['Final_Weight']
+                
+                st.dataframe(
+                    display_df.loc[display_df['Weight %'] > 0.1].sort_values('Weight %', ascending=False).style.format({
+                        'Alpha Sharpe': '{:.2f}',
+                        'Stability': '{:.1%}',
+                        'Weight %': '{:.1f}%'
+                    }),
+                    use_container_width=True
+                )
+            except KeyError as e:
+                st.error(f"UI Display Error: {e}")
+
+    # --- 6. ALPHA SCORING (Unconstrained Pure Alpha) ---
+    alpha_score = pd.Series(0.0, index=results_df.index)
+    if active_weights:
+        for long_name, weight in active_weights.items():
             if weight > 0:
                 short_name = REVERSE_METRIC_NAME_MAP.get(long_name)
-                
                 if short_name in results_df.columns:
-                    
-                    # 1. Determine the ranking direction based on the aggregated IC signal
-                    # If avg_IC is > 0, rank ascending (higher factor value is better).
-                    # If avg_IC is < 0, rank descending (lower factor value is better).
-                    
-                    avg_ic = signal_directions.get(short_name, 0.0)
-                    
-                    # If avg_ic is effectively zero or positive, we rank ascending (True).
-                    # If avg_ic is negative, we rank descending (False).
-                    rank_ascending = (avg_ic >= 0) 
+                    # Automatically determine rank direction from the Factor Brain
+                    avg_ic_dir = active_rationale.loc[short_name, 'avg_ic'] if short_name in active_rationale.index else 1.0
+                    rank_ascending = (avg_ic_dir >= 0)
+                    alpha_score += results_df[short_name].rank(pct=True, ascending=rank_ascending).fillna(0.5) * weight
 
-                    # 2. Calculate the rank (0 to 1)
-                    rank_series = results_df[short_name].rank(pct=True, ascending=rank_ascending)
-                    
-                    # 3. Apply weight and accumulate score
-                    alpha_score += rank_series.fillna(0.5) * weight
-                else:
-                    logging.warning(f"Metric '{long_name}' (short name '{short_name}') not found in results_df columns. Contributing neutral score.")
-                    alpha_score += 0.5 * weight # Neutral contribution if factor is not found
-        
-        # Remaining part of the scoring block (calculate Z-score)
-        def z_score_robust(series):
-            # ... (keep the rest of this helper function unchanged) ...
-            if series.empty:
-                return pd.Series(np.nan, index=series.index)
-            median_val = series.median()
-            mad_val = (series - median_val).abs().median()
-            
-            if mad_val < 1e-6:
-                return pd.Series(0.0, index=series.index)
-            
-            return 0.6745 * (series - median_val) / mad_val
-
-        results_df['Score'] = z_score_robust(alpha_score)
-    else:
-        results_df['Score'] = np.nan
-        st.warning("Cannot calculate Alpha Scores: results_df or user_weights are empty/invalid.")
-        
+        # Standardize for the quantitative dashboard
+        med = alpha_score.median()
+        mad = (alpha_score - med).abs().median()
+        results_df['Score'] = 0.6745 * (alpha_score - med) / (mad if mad > 0 else 1.0)
+    
     top_15_df = results_df.sort_values('Score', ascending=False).head(15).copy()
     top_15_tickers = top_15_df['Ticker'].tolist()
 
-    # --- Portfolio Overview & Hedging ---
+    # --- 7. SOPHISTICATED PORTFOLIO CONSTRUCTION ---
     st.header("📈 Portfolio Overview & Hedging")
     if not top_15_tickers:
-        st.warning("No stocks for portfolio construction (top 15 list is empty)."); st.stop()
-    
-    st.subheader(f"Core Portfolio (Long Book): Weights by {weighting_method_ui}")
-    # Ensure winsorized_returns_dict is not empty for portfolio_returns_df
-    if not winsorized_returns_dict:
-        st.error("Cannot construct portfolio returns: Winsorized returns dictionary is empty."); st.stop()
-        
-    # --- IMPORTANT CORRECTION: Convert log returns to simple returns for portfolio_returns_df ---
-    # winsorized_returns_dict contains LOG returns. Most portfolio calculations (Sharpe, variance, etc.)
-    # typically expect simple returns.
-    simple_returns_dict = {
-        ticker: np.expm1(log_rets) # np.expm1(x) calculates exp(x) - 1, converting log returns to simple returns
-        for ticker, log_rets in winsorized_returns_dict.items()
-    }
-    portfolio_returns_df = pd.DataFrame(simple_returns_dict).reindex(columns=top_15_tickers).dropna(how='all')
-    
-    if portfolio_returns_df.empty:
-        st.error("Portfolio returns DataFrame is empty after reindexing/dropping NaNs. Cannot proceed with portfolio analysis."); st.stop()
+        st.warning("Strategy yielded no investable tickers."); st.stop()
 
-    _, cov_matrix = calculate_correlation_matrix(top_15_tickers, winsorized_returns_dict, window=corr_window) # Note: winsorized_returns_dict is LOG returns here
+    # Convert log to simple returns for variance/covariance logic
+    simple_rets_dict = {t: np.expm1(rets) for t, rets in winsorized_returns_dict.items()}
+    portfolio_returns_df = pd.DataFrame(simple_rets_dict).reindex(columns=top_15_tickers).dropna(how='all')
+
+    # Denoised Covariance Matrix (OAS + Spectral Denoising)
+    _, cov_matrix = calculate_sophisticated_covariance_matrix(top_15_tickers, winsorized_returns_dict, window=corr_window)
+    
     method_map = {"Equal Weight": "equal", "Inverse Volatility": "inv_vol", "Log Log Sharpe Optimized": "log_log_sharpe"}
-    # Pass portfolio_returns_df (simple returns) to calculate_weights
-    p_weights = calculate_weights(portfolio_returns_df, method=method_map.get(weighting_method_ui, "equal"), cov_matrix=cov_matrix)
+    p_weights = calculate_weights(portfolio_returns_df, method=method_map.get(weighting_method_ui), cov_matrix=cov_matrix)
     
-    if p_weights.empty:
-        st.error("Portfolio weights could not be calculated. Cannot proceed with portfolio analysis."); st.stop()
-
-    weights_df = p_weights.reset_index(); weights_df.columns = ['Ticker', 'Weight']
+    weights_df = p_weights.reset_index()
+    weights_df.columns = ['Ticker', 'Weight']
     weights_df = pd.merge(weights_df, top_15_df[['Ticker', 'Name', 'Sector']], on='Ticker', how='left')
     st.dataframe(weights_df[['Ticker', 'Name', 'Weight']].sort_values("Weight", ascending=False), use_container_width=True)
 
-    with st.expander("🔬 View Long Book Risk Analysis", expanded=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Average Beta Exposure")
-            
-            if 'Beta_to_SPY' in top_15_df.columns and not top_15_df['Beta_to_SPY'].empty and pd.notna(top_15_df['Beta_to_SPY']).any():
-                avg_beta_val = top_15_df['Beta_to_SPY'].mean()
-                st.metric("Average Beta (Conservative)", f"{avg_beta_val:.2f}", help="Weighted average of up and down market betas.")
-            else:
-                st.info("Beta to SPY not available for current portfolio.") 
-            
-            if 'Beta_Down_Market' in top_15_df.columns and not top_15_df['Beta_Down_Market'].empty and pd.notna(top_15_df['Beta_Down_Market']).any():
-                avg_down_beta = top_15_df['Beta_Down_Market'].mean()
-                st.metric("Avg. Down-Market Beta", f"{avg_down_beta:.2f}", help="Portfolio sensitivity during market declines. Lower is more defensive.")
-            else:
-                st.info("Beta_Down_Market column was not found or contains no valid data.") 
-            
-            if not top_15_df.empty and 'Sector' in top_15_df.columns:
-                sector_counts = top_15_df['Sector'].value_counts()
-                if not sector_counts.empty:
-                    sector_fig = plot_sector_concentration(sector_counts)
-                    st.plotly_chart(sector_fig, use_container_width=True)
-                else:
-                    st.info("No sector data available for concentration plot.")
-            else:
-                st.info("Top 15 DataFrame is empty or missing 'Sector' column for concentration plot.")
-
-        with col2:
-            st.subheader("Factor ETF Correlation (Portfolio DNA)")
-            factor_correlations = calculate_portfolio_factor_correlations(weights_df, etf_histories)
-            if not factor_correlations.empty:
-                factor_fig = plot_factor_correlations(factor_correlations.head(10))
-                st.plotly_chart(factor_fig, use_container_width=True)
-            else:
-                st.info("No factor correlations could be calculated for the portfolio.")
-
-    # --- Hedging Calculation and Display ---
-    # --- Hedging Calculation and Display ---
+    # --- 8. ROBUST HEDGING LOGIC ---
     hedge_weights = pd.Series(dtype=float)
-    if hedge_risks and not portfolio_returns_df.empty: # Only try to hedge if there's a portfolio (simple returns)
+    if hedge_risks and not portfolio_returns_df.empty:
         with st.spinner(f"Calculating robust, regime-aware hedge for {', '.join(hedge_risks)}..."):
             hedge_instrument_returns_dict = {
                 etf: etf_histories[etf]['Close'].pct_change(fill_method=None).dropna() 
@@ -4140,444 +4040,87 @@ def main():
             }
             if hedge_instrument_returns_dict:
                 hedge_instrument_returns_df = pd.DataFrame(hedge_instrument_returns_dict)
+                common_idx = portfolio_returns_df.index.intersection(hedge_instrument_returns_df.index)
                 
-                aligned_portfolio_returns_for_hedge, aligned_hedge_returns = portfolio_returns_df.align( # Use portfolio_returns_df (simple returns)
-                    hedge_instrument_returns_df, join='inner', axis=0
-                )
-                if not aligned_portfolio_returns_for_hedge.empty and not aligned_hedge_returns.empty:
-                    aligned_portfolio_returns_for_hedge = aligned_portfolio_returns_for_hedge.fillna(0.0)
-                    aligned_hedge_returns = aligned_hedge_returns.fillna(0.0)
+                if len(common_idx) > 30:
+                    aligned_p_rets = (portfolio_returns_df.loc[common_idx] * p_weights).sum(axis=1)
+                    aligned_hedge_rets = hedge_instrument_returns_df.loc[common_idx]
                     
-                    # calculate_robust_hedge_weights returns negative weights for short positions
-                    hedge_weights = calculate_robust_hedge_weights(
-                        aligned_portfolio_returns_for_hedge, 
-                        aligned_hedge_returns, 
+                    # Core robust hedging call
+                    raw_hedge_weights = calculate_robust_hedge_weights(
+                        aligned_p_rets.to_frame('Portfolio'), 
+                        aligned_hedge_rets, 
                         lambda_uncertainty=lambda_uncertainty_ui
                     )
-                else:
-                    st.info("Not enough aligned data for hedging calculation after filtering. Skipping hedge.")
-            else:
-                st.info("No valid hedge instruments with history found. Skipping hedging calculation.")
+                    
+                    # Scaling factor for Net Exposure (Target = Long + (HedgeSum * Scale))
+                    long_exposure = 1.0
+                    raw_hedge_sum = raw_hedge_weights.sum()
+                    if abs(raw_hedge_sum) > 1e-5:
+                        k_scale = (target_net_exposure_ui - long_exposure) / raw_hedge_sum
+                        hedge_weights = raw_hedge_weights * k_scale
+                    else:
+                        hedge_weights = raw_hedge_weights # No scaling if weights are 0
 
-    # Display section for hedging
-    if not hedge_weights.empty and not portfolio_returns_df.empty:
-        st.subheader("Hedge Portfolio & Final Exposure")
+    if not hedge_weights.empty:
+        st.subheader("Final Hedging Allocation")
+        h_df = hedge_weights.reset_index()
+        h_df.columns = ['Instrument', 'Weight']
+        st.dataframe(h_df[abs(h_df['Weight']) > 1e-4].style.format({'Weight': '{:.2%}'}), use_container_width=True)
         
-        long_exposure_amount = 1.0 # The long book is 100% of capital, represented as 1.0 notional
-
-        current_optimal_hedge_sum = hedge_weights.sum() 
-
-        k_scaling_factor = 1.0 # Default to 1 (apply optimal hedge directly)
-
-        if current_optimal_hedge_sum != 0: # Avoid division by zero
-            k_scaling_factor = (target_net_exposure_ui - long_exposure_amount) / current_optimal_hedge_sum
-        
-        scaled_hedge_weights = hedge_weights * k_scaling_factor
-
-        total_short_exposure_magnitude = abs(min(0, scaled_hedge_weights.sum())) 
-        
-        final_net_exposure_calculated = long_exposure_amount + scaled_hedge_weights.sum() 
-        
-        hedge_display_df = scaled_hedge_weights.reset_index()
-        hedge_display_df.columns = ['Hedge Instrument', 'Weight']
-        
-        # CRITICAL FIX: The right-hand side should refer to `hedge_display_df`, not `display_hedge_df`
-        display_hedge_df = hedge_display_df[abs(hedge_display_df['Weight']) > 1e-5].copy() 
-        
-        display_hedge_df['Weight %'] = display_hedge_df['Weight'] * 100 
-        
-        if scaled_hedge_weights.sum() > 0.01 and target_net_exposure_ui > long_exposure_amount: # If hedge became a long component
-             st.write("These are the **scaled NOTIONAL adjustments** for your target net exposure (negative implies short).")
-        else:
-             st.write("These are the **scaled short positions** required to meet your target net exposure.")
-
-        st.dataframe(display_hedge_df[['Hedge Instrument', 'Weight %']].sort_values('Weight %'), use_container_width=True)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Long Exposure", f"{long_exposure_amount:.1%}")
-        col2.metric("Short Exposure (Hedge)", f"{total_short_exposure_magnitude:.1%}") 
-        col3.metric("Net Exposure", f"{final_net_exposure_calculated:.1%}")
-    elif hedge_risks: 
-        st.info("Hedging calculation failed or returned empty weights. Check data availability for hedge instruments.")
-    else: 
-        st.info("No hedge instruments selected. Portfolio has 100% long exposure.")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Long Exposure", "100.0%")
-        col2.metric("Short Exposure (Hedge)", "0.0%")
-        col3.metric("Net Exposure", "100.0%")
-    
-    st.divider()
-
-    # --- Initialize benchmark_metrics upfront ---
-    benchmark_metrics = get_benchmark_metrics() 
-    if not benchmark_metrics:
-        benchmark_metrics = {'Volatility': np.nan, 'Sharpe Ratio': np.nan}
-        st.warning("Could not fetch benchmark metrics (SPY). Performance comparisons may be incomplete.")
-    
-    # --- Portfolio Performance Metrics ---
-    st.subheader("📊 Portfolio Strategy Performance Metrics")
-
-    # Fetch SPY simple returns (for tracking error)
-    spy_simple_returns_series = etf_histories['SPY']['Close'].pct_change(fill_method=None).dropna()
-    # Convert SPY returns to LOG RETURNS for consistency with winsorized_returns_dict
-    spy_log_returns_series = np.log1p(spy_simple_returns_series.clip(lower=-0.9999))
-
-    # --- Initialize all metrics and relevant DataFrames/Series to safe empty states ---
-    ic, ir, malv, twr_val, prob_losing_val, avg_idio_var_n1 = np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
-    total_vol = np.nan 
-    tracking_error = np.nan 
-    estimated_alpha_value = np.nan 
-
-    final_returns = pd.Series(dtype=float) 
-    lagged_forecast_ts = pd.Series(dtype=float) 
-    valid_tickers_for_metrics = [] 
-    
-    # NEW: Initialize aligned_returns DataFrames used across sections
-    aligned_returns_for_metrics = pd.DataFrame() # General purpose aligned returns
-    aligned_returns_for_icir_metrics = pd.DataFrame() # For IC/IR, TE
-    aligned_returns_for_twr_metrics = pd.DataFrame() # For TWR, MALV, idio_var_n1
-
-    # NEW: Initialize factor_returns_df for the risk dashboard
-    factor_returns_df = pd.DataFrame() # Initialized here, populated in dashboard section
-    # Ensure portfolio_returns_df (simple returns) and p_weights are not empty/None
-    if portfolio_returns_df.empty or p_weights is None or p_weights.empty:
-        st.info("Portfolio returns or weights are not available for performance metrics calculation.")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Long Exposure", "100.0%")
+        c2.metric("Short Exposure", f"{abs(min(0, hedge_weights.sum())):.1%}")
+        c3.metric("Net Exposure", f"{(1.0 + hedge_weights.sum()):.1%}")
     else:
-        # Align portfolio_returns_df with spy_simple_returns_series (for all metrics expecting simple returns)
-        common_idx_for_metrics = portfolio_returns_df.index.intersection(spy_simple_returns_series.index)
-        aligned_returns_for_metrics = portfolio_returns_df.loc[common_idx_for_metrics].copy().fillna(0.0)
+        st.info("No active hedge positions.")
 
-        if aligned_returns_for_metrics.empty:
-            st.info("Aligned portfolio returns are empty for performance metrics calculation due to data alignment issues.")
-        else:
-            valid_tickers_for_metrics = aligned_returns_for_metrics.columns.tolist()
-            if not valid_tickers_for_metrics:
-                st.info("No valid tickers remain after aligning portfolio returns for metrics. Skipping performance metrics.")
-            else:
-                aligned_w = p_weights.reindex(valid_tickers_for_metrics).fillna(0)
-                final_returns = (aligned_returns_for_metrics * aligned_w).sum(axis=1) # The portfolio's actual returns (simple returns)
-
-                # Calculate IVar_n=1 for TWR/Prob Losing (requires log returns, use spy_log_returns_series for benchmark)
-                if returns_dict and not spy_log_returns_series.empty:
-                    # winsorized_returns_dict contains log returns, avg_idio_var_n1 should be based on log returns
-                    avg_idio_var_n1 = calculate_idio_variance_single_stock(winsorized_returns_dict, spy_log_returns_series)
-                else:
-                    logging.warning("Returns dictionary or SPY log returns series is empty/invalid. Cannot calculate avg_idio_var_n1.")
-
-                # --- Calculate alpha_weights and related forecast series ---
-                if not top_15_df.empty and 'Ticker' in top_15_df.columns and 'Score' in top_15_df.columns:
-                    filtered_top_15_df = top_15_df[top_15_df['Ticker'].isin(valid_tickers_for_metrics)]
-                    if not filtered_top_15_df.empty:
-                        aligned_scores = filtered_top_15_df.set_index('Ticker')['Score']
-                        if not aligned_scores.empty and aligned_scores.sum() != 0:
-                            alpha_weights = aligned_scores / aligned_scores.sum()
-                            valid_forecast_tickers = list(set(aligned_returns_for_metrics.columns) & set(alpha_weights.index))
-                            if valid_forecast_tickers:
-                                # Forecast is based on SIMPLE returns of the portfolio constituents
-                                forecast_ts_unlagged = (aligned_returns_for_metrics.loc[:, valid_forecast_tickers] * alpha_weights.loc[valid_forecast_tickers]).sum(axis=1)
-                                lagged_forecast_ts = forecast_ts_unlagged.shift(1)
-                            else:
-                                st.info("No valid tickers for alpha forecast after alignment.")
-                        else:
-                            st.info("Alpha scoring could not be performed (empty or zero sum scores after filtering).")
-                    else:
-                        st.info("No top_15_df tickers align with valid portfolio metrics tickers for alpha scoring.")
-                else:
-                    st.info("top_15_df is empty or missing 'Ticker'/'Score' columns for alpha scoring.")
-
-                # Calculate MALV if possible (requires log returns, and a DataFrame of these)
-                valid_cov_tickers = list(set(valid_tickers_for_metrics) & set(cov_matrix.columns))
-                if len(valid_cov_tickers) > 1:
-                    # MALV calculation should use log returns for consistency (as per Mahalanobis definition)
-                    # Need to construct a log_returns_df from winsorized_returns_dict
-                    # Filter this by common_idx_for_metrics (which represents the intersection of portfolio and SPY simple returns)
-                    # This ensures temporal alignment.
-                    malv_log_returns_df = pd.DataFrame(winsorized_returns_dict).reindex(columns=valid_cov_tickers).loc[common_idx_for_metrics].dropna(how='all')
-                    if not malv_log_returns_df.empty:
-                        aligned_cov_matrix = cov_matrix.loc[valid_cov_tickers, valid_cov_tickers]
-                        malv, _ = calculate_mahalanobis_metrics(malv_log_returns_df, aligned_cov_matrix)
-                    else:
-                        st.info("Insufficient valid log returns for Mahalanobis calculation after alignment.")
-                else:
-                    logging.warning("Insufficient valid tickers for Mahalanobis calculation.")
-
-
-                # Calculate IC/IR and Tracking Error only if forecast and final returns are available
-                if not lagged_forecast_ts.empty and not final_returns.empty and not spy_simple_returns_series.empty:
-                    aligned_benchmark_returns_for_icir = spy_simple_returns_series.loc[final_returns.index]
-                    if not aligned_benchmark_returns_for_icir.empty:
-                        ic, ir = calculate_information_metrics(lagged_forecast_ts, final_returns, aligned_benchmark_returns_for_icir)
-
-                        active_returns = final_returns - aligned_benchmark_returns_for_icir
-                        if active_returns.std() > 1e-6:
-                            tracking_error = active_returns.std() * np.sqrt(252)
-                        else:
-                            tracking_error = 0.0
-                    else:
-                        st.info("Aligned benchmark returns are empty for IC/IR and Tracking Error calculation.")
-                else:
-                    st.info("Cannot calculate Information Coefficient, Ratio, or Tracking Error (forecast, portfolio, or benchmark returns missing).")
-
-
-    # --- Display Metrics (using initialized NaN values if not calculated) ---
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Precision Matrix Quality (MALV)", f"{malv:.4f}" if pd.notna(malv) else "N/A", help=f"Expected: {2/len(valid_cov_tickers):.4f}" if 'valid_cov_tickers' in locals() and valid_cov_tickers else "N/A")
-    col2.metric("Information Coefficient (IC)", f"{ic:.4f}" if pd.notna(ic) else "N/A", help="Lagged correlation of alpha vs returns.")
-    col3.metric("Information Ratio (IR)", f"{ir:.4f}" if pd.notna(ir) else "N/A", help="Risk-adjusted return (Sharpe).")
-
-    # --- TWR & Probability of Losing Calculation & Display (using initialized NaN values) ---
-    benchmark_sharpe = benchmark_metrics.get('Sharpe Ratio', np.nan)
-    
-    # All conditions for TWR/Prob Losing must be met:
-    if pd.notna(ir) and pd.notna(avg_idio_var_n1) and valid_tickers_for_metrics and pd.notna(benchmark_sharpe):
-        with st.sidebar.expander("TWR & Prob Losing Parameters", expanded=False):
-            twr_time_horizon = st.slider("Time Horizon (Years)", 1, 30, 5, key="twr_time_horizon")
-            twr_risk_free_rate = st.slider("Risk-Free Rate (%)", 0.0, 10.0, 4.0, 0.5, format="%.1f%%", key="twr_risk_free_rate") / 100.0
-            comparison_vol = st.slider("Comparison Target Volatility (%)", 5.0, 30.0, 20.0, 1.0, format="%.1f%%", key="comparison_vol_twr") / 100.0
-            num_bm_stocks = st.number_input("Benchmark Stocks (n_BM)", min_value=100, value=500, step=100, key="num_bm_stocks")
-            effective_leverage_f = 1.0 + target_net_exposure_ui # Target Net Exposure acts as overall leverage
-
-        twr_val, prob_losing_val = calculate_terminal_wealth_metrics(
-            portfolio_sharpe=ir,
-            benchmark_sharpe=benchmark_sharpe,
-            port_idio_var_n1_avg=avg_idio_var_n1,
-            num_port_stocks=len(valid_tickers_for_metrics),
-            comparison_target_vol=comparison_vol,
-            num_bm_stocks=num_bm_stocks,
-            leverage_f=effective_leverage_f,
-            time_horizon_years=twr_time_horizon,
-            risk_free_rate=twr_risk_free_rate
-        )
+    # --- 9. QUANTITATIVE PERFORMANCE DASHBOARD ---
+    spy_simple = etf_histories['SPY']['Close'].pct_change(fill_method=None).dropna()
+    common = portfolio_returns_df.index.intersection(spy_simple.index)
+    if not common.empty:
+        # Annualized Stats
+        p_rets = (portfolio_returns_df.loc[common] * p_weights).sum(axis=1)
+        ic_val, ir_val = calculate_information_metrics(p_rets.shift(1), p_rets, spy_simple.loc[common])
+        malv_val, _ = calculate_mahalanobis_metrics(portfolio_returns_df.loc[common], cov_matrix)
         
-        if pd.notna(twr_val) and pd.notna(prob_losing_val):
-            st.subheader(f"🔮 Long-Term Wealth Projection (over {twr_time_horizon} years, at {comparison_vol*100:.1f}% Target Volatility)")
-            col_twr_1, col_twr_2 = st.columns(2)
-            col_twr_1.metric("Expected Terminal Wealth Ratio (TWR)", f"{twr_val:.2f}x", help="Expected compounded wealth relative to starting capital if benchmark has 1.0x. Higher is better.")
-            col_twr_2.metric("Prob. of Losing to Benchmark", f"{prob_losing_val:.1%}", help="Probability your portfolio underperforms the fully diversified benchmark in geometric terms.")
-        else:
-            st.info("Insufficient data or invalid parameters for TWR/Probability of Losing calculation.")
-    else:
-        st.info("TWR/Probability of Losing cannot be calculated due to missing Information Ratio, Idiosyncratic Variance, or Benchmark Sharpe.")
-    # --- Advanced Risk Dashboard ---
-    # --- Advanced Risk Dashboard ---
-    # --- Advanced Risk Dashboard ---
-# --- Advanced Risk Dashboard ---
-    # --- Advanced Risk Dashboard ---
-    st.subheader("🔬 Quantitative Risk Dashboard")
-    col1, col2 = st.columns([0.4, 0.6])
-    with col1:
-        st.subheader("Portfolio vs. Benchmark (SPY)")
-        with st.spinner("Decomposing portfolio risk..."):
-            # Initialize factor_returns_df to an empty DataFrame, will be populated if data is available
-            factor_returns_df = pd.DataFrame() 
-            temp_factor_returns_df = pd.DataFrame({etf: etf_histories[etf]['Close'].pct_change(fill_method=None) for etf in factor_etfs if etf in etf_histories}).dropna(how='all')
-            
-            if not temp_factor_returns_df.empty:
-                factor_returns_df = temp_factor_returns_df.loc[:, temp_factor_returns_df.std() > 1e-6]
-            
-            total_var, sys_var, spec_var = np.nan, np.nan, np.nan 
+        st.subheader("Strategy Risk Metrics")
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Matrix Quality (MALV)", f"{malv_val:.4f}", help="Fixed by Spectral Denoising. Target > 0.05")
+        col2.metric("Information Coefficient (IC)", f"{ic_val:.4f}")
+        col3.metric("Information Ratio (IR)", f"{ir_val:.4f}")
 
-            if not factor_returns_df.empty and not aligned_returns_for_metrics.empty and not weights_df.empty and aligned_returns_for_metrics.std().sum() > 1e-6: 
-                factor_cov = factor_returns_df.cov() * 252 
-                total_var, sys_var, spec_var = decompose_portfolio_risk(aligned_returns_for_metrics, weights_df, factor_returns_df, factor_cov)
-            else:
-                if factor_returns_df.empty:
-                    st.info("Factor returns for risk decomposition are empty or have zero variance. Cannot decompose portfolio risk.")
-                elif aligned_returns_for_metrics.empty or weights_df.empty:
-                    st.info("Individual stock returns or weights for the portfolio are empty. Cannot decompose portfolio risk.")
-                elif aligned_returns_for_metrics.std().sum() <= 1e-6:
-                    st.info("Individual stock returns for the portfolio have zero variance (all constant). Cannot decompose portfolio risk.")
-                else:
-                    st.info("Could not decompose portfolio risk due to an unhandled data issue.") 
-
-            if pd.notna(total_var) and total_var > 0:
-                spec_pct = (spec_var / total_var) * 100
-                st.metric("Idiosyncratic Risk %", f"{spec_pct:.1f}%" if pd.notna(spec_pct) else "N/A", f"{spec_pct - 0:.1f}% vs SPY" if pd.notna(spec_pct) else None, help="The portion of risk unique to your stock picks. SPY is 0% by definition. Higher is better.")
-                total_vol = np.sqrt(total_var) 
-                bench_vol = benchmark_metrics.get('Volatility', np.nan)
-                st.metric("Annualized Volatility", f"{total_vol:.2%}" if pd.notna(total_vol) else "N/A", f"{(total_vol - bench_vol)/bench_vol:.1%}" if pd.notna(total_vol) and pd.notna(bench_vol) and bench_vol != 0 else None, help="Total portfolio risk. Delta shows difference vs. SPY.")
-                
-                # --- Re-introducing Expected Active Return (Alpha) with simplified explanation ---
-                expected_alpha_bps = np.nan
-                if pd.notna(ir) and pd.notna(tracking_error) and tracking_error > 0:
-                    expected_alpha_bps = ir * tracking_error * 10000 # Convert to basis points
-                    st.metric(
-                        "Expected Active Return (Alpha)", 
-                        f"{expected_alpha_bps:.2f} bp/yr", 
-                        help="Your portfolio's estimated skill in generating returns above what's expected from its market risk (calculated from Information Ratio and Tracking Error)."
-                    )
-                    st.caption("This is the extra return your portfolio aims to achieve compared to a basic market-tracking strategy.")
-                else:
-                    st.info("Expected Active Return (Alpha) cannot be calculated (missing Information Ratio or Tracking Error).")
-
-                # --- Alpha vs. Diversification Hurdle ---
-                num_bm_stocks_for_hurdle = locals().get('num_bm_stocks', 500) 
-                
-                if pd.notna(avg_idio_var_n1) and pd.notna(ir) and ir > 0 and num_bm_stocks_for_hurdle > 0 and len(valid_tickers_for_metrics) > 0: # Ensure valid inputs
-                    num_port_stocks_current = len(valid_tickers_for_metrics) 
-                    
-                    diversification_drag_term = (1/num_port_stocks_current - 1/num_bm_stocks_for_hurdle) * avg_idio_var_n1 / 2
-                    
-                    st.subheader("🎯 Alpha vs. Diversification Hurdle")
-                    st.info("To geometrically outperform a diversified benchmark, your average stock-picking alpha needs to overcome a diversification drag specific to your portfolio size and stock type.")
-                    
-                    col_alpha_1, col_alpha_2 = st.columns(2)
-                    col_alpha_1.metric("Current Portfolio Size", f"{num_port_stocks_current} stocks")
-                    
-                    if diversification_drag_term > 0:
-                        col_alpha_2.metric("Min Alpha to Overcome Drag (Unlevered)", f"{diversification_drag_term * 10000:.2f} bp/yr" if pd.notna(diversification_drag_term) else "N/A", 
-                                        help=f"Annualized alpha (in basis points) required to offset the geometric return drag from *under-diversification* relative to a benchmark of {num_bm_stocks_for_hurdle} stocks. Current IVar_n=1: {avg_idio_var_n1:.4f}.")
-                    else:
-                        col_alpha_2.metric("Diversification Advantage", f"{abs(diversification_drag_term) * 10000:.2f} bp/yr" if pd.notna(diversification_drag_term) else "N/A",
-                                            help="Your portfolio is more diversified than the benchmark in this metric, providing a geometric return bonus.")
-                    
-                    # --- Enhanced Caption for Diversification Hurdle ---
-                    if pd.notna(avg_idio_var_n1) and pd.notna(num_port_stocks_current) and pd.notna(num_bm_stocks_for_hurdle):
-                        nP_current = num_port_stocks_current
-                        nBM = num_bm_stocks_for_hurdle
-                        idio_var = avg_idio_var_n1
-                        lev_f_val = locals().get('effective_leverage_f', 1.0) # From TWR parameters or default 1.0
-
-                        # Calculate hypothetical drag changes for +5 and -5 stocks
-                        drag_plus_5_bps = np.nan
-                        nP_plus_5 = nP_current + 5
-                        if nP_plus_5 > 0:
-                            idio_diff_plus_5 = (1/nP_plus_5 - 1/nBM) * idio_var
-                            drag_plus_5_bps = 0.5 * idio_diff_plus_5 * (lev_f_val**2) * 10000
-
-                        drag_minus_5_bps = np.nan
-                        nP_minus_5 = max(1, nP_current - 5) # Ensure at least 1 stock
-                        if nP_minus_5 > 0:
-                            idio_diff_minus_5 = (1/nP_minus_5 - 1/nBM) * idio_var
-                            drag_minus_5_bps = 0.5 * idio_diff_minus_5 * (lev_f_val**2) * 10000
-                        
-                        caption_text = (
-                            f"**Impact of Portfolio Size:** With your current {nP_current} stocks, the diversification drag is {diversification_drag_term * 10000:.2f} bp/yr. "
-                            f"If you had {nP_plus_5} stocks, this drag would be {drag_plus_5_bps:.2f} bp/yr. "
-                            f"If you had {nP_minus_5} stocks, it would be {drag_minus_5_bps:.2f} bp/yr. "
-                            f"This illustrates how adding stocks can reduce the geometric drag, leaving more room for your active alpha to shine."
-                        )
-                        st.caption(caption_text)
-                else:
-                    st.info("Alpha vs. Diversification Hurdle cannot be calculated (missing Idiosyncratic Variance, Information Ratio, or portfolio/benchmark size).")
-
-                # --- "Average Beta to SPY" Display ---
-                if not top_15_df.empty and 'Beta_to_SPY' in top_15_df.columns and pd.notna(top_15_df['Beta_to_SPY']).any():
-                    avg_beta_val = top_15_df['Beta_to_SPY'].mean()
-                    st.metric(
-                        "Average Beta to SPY", 
-                        f"{avg_beta_val:.2f}" if pd.notna(avg_beta_val) else "N/A", 
-                        delta=f"{(avg_beta_val - 1.0):.2f}" if pd.notna(avg_beta_val) else None, 
-                        help="Portfolio sensitivity to the S&P 500. SPY is 1.0 by definition."
-                    )
-                    # --- Explanation for Beta's Impact ---
-                    st.caption(
-                        "Your portfolio's Beta to SPY shows how sensitive it is to overall market movements. "
-                        "A beta of 1.0 moves with the market. Above 1.0 means more movement, below 1.0 means less. "
-                        "Your active alpha is the extra return you generate *beyond* what this market sensitivity would predict."
-                    )
-                else:
-                    st.info("Beta to SPY not available for current portfolio.")
-
-            else: # This 'else' block belongs to the `if pd.notna(total_var) and total_var > 0:` condition
-                st.info("Total portfolio variance is not available or is zero. Cannot perform detailed risk decomposition.") 
-
-
-    with col2:
-        st.subheader("Systematic Risk Exposure Breakdown")
-        if not aligned_returns_for_metrics.empty and not p_weights.empty and not factor_returns_df.empty and not final_returns.empty and final_returns.std() > 1e-6: 
-            portfolio_betas = calculate_portfolio_factor_betas(final_returns, factor_returns_df) 
-            meaningful_factors = ['SPY', 'QQQ', 'IWM', 'MTUM', 'QUAL', 'IVE', 'IVW', 'USMV']
-            display_betas = portfolio_betas.reindex(meaningful_factors).dropna()
-            if not display_betas.empty:
-                fig = plot_factor_exposure_breakdown(display_betas)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("No meaningful factor betas to display after filtering.")
-        else:
-            st.info("Portfolio returns, weights, or factor returns are not available for factor exposure analysis.")
-    # --- Detailed Reports Section ---
-    st.header("📑 Detailed Reports")
-    st.sidebar.divider()
-    st.sidebar.header("Individual Stock Analysis")
-    
-    # Default ticker selection logic (made more robust)
-    default_ticker = None
-    if not top_15_df.empty and 'Ticker' in top_15_df.columns and not top_15_df['Ticker'].empty:
-        first_top_ticker = top_15_df['Ticker'].iloc[0]
-        if first_top_ticker in results_df['Ticker'].unique().tolist():
-            default_ticker = first_top_ticker
-    elif not results_df.empty and 'Ticker' in results_df.columns and not results_df['Ticker'].empty:
-        default_ticker = results_df['Ticker'].iloc[0]
-
-    options = sorted(results_df['Ticker'].unique().tolist()) # Ensure options are always sorted for consistency
-
-    # --- DEFINE TABS FIRST - This makes them independent ---
+    # --- 10. THE FULL 5-TAB INTERFACE ---
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "🔬 Stock Dashboard & Financials", 
+        "🔬 Stock Dashboard", 
         "🛄 Factor Analysis", 
         "🔥 Financial Turbulence", 
         "📜 Theoretical Background", 
         "📄 Full Data Table"
     ])
 
-    # --- Populate Tab 1: Stock Dashboard (This one is stock-specific) ---
     with tab1:
-        if default_ticker and options: # Ensure there's a default ticker and options exist
-            selected_ticker = st.sidebar.selectbox(
-                "Select a Ticker for Deep Dive", 
-                options=options, 
-                index=options.index(default_ticker) if default_ticker in options else 0 
-            )
-            
-            display_stock_dashboard(selected_ticker, results_df, winsorized_returns_dict, etf_histories)
-            display_deep_dive_data(selected_ticker)
-        else:
-            st.warning("No stocks available in the portfolio to display a dashboard.")
+        ticker_list = sorted(results_df['Ticker'].unique().tolist())
+        selected_ticker = st.sidebar.selectbox("Select Ticker for Analysis", options=ticker_list)
+        display_stock_dashboard(selected_ticker, results_df, winsorized_returns_dict, etf_histories)
+        display_deep_dive_data(selected_ticker)
 
-    # --- Populate Tab 2: Factor Analysis (Context is portfolio-level) --
-    with tab2: # This is the Factor Analysis Tab
-        st.subheader("Factor Weighting Rationale (Aggregated)")
-        st.write("This table shows the final aggregated scores and weights for each factor, derived from analyzing performance across multiple time horizons.")
-        if not active_rationale.empty:
-            # Display the main rationale table (this part is likely already correct)
-            st.dataframe(active_rationale)
-        else:
-            st.info("Factor rationale not available (Factor Stability Analysis failed).")
-        
-        # --- THIS IS THE MODIFIED PART FOR THE EXPANDER ---
-        st.subheader("Pure Factor Returns (By Individual Horizon)")
-        st.write("These are the underlying raw factor returns calculated for each time horizon. The table above aggregates these results.")
-        if stability_results: 
-            for horizon_label, horizon_df in stability_results.items():
-                if horizon_df is not None and not horizon_df.empty:
-                    with st.expander(f"Details for {horizon_label} Horizon"):
-                        st.dataframe(horizon_df.sort_values('Pure_Return', key=abs, ascending=False))
-                else:
-                    st.info(f"No significant factors found for {horizon_label} horizon or data missing.")
-        else:
-            st.info("Factor stability analysis results are not available to display by horizon.")
+    with tab2:
+        st.subheader("Sophisticated Factor Stability Results")
+        st.dataframe(active_rationale.style.format({'ic_ir': '{:.2f}', 'consistency': '{:.1%}', 'Final_Weight': '{:.1f}'}))
+        for h, h_df in horizon_details.items():
+            with st.expander(f"Horizon Raw ICs: {h}"):
+                st.dataframe(h_df.sort_values(ascending=False, key=abs))
 
-    # --- Populate Tab 3: Financial Turbulence (This is a macro analysis) ---
     with tab3:
-        if 'display_turbulence_and_regime_analysis' in globals():
-            display_turbulence_and_regime_analysis()
-        else:
-            st.error("Error: The 'display_turbulence_and_regime_analysis' function is missing or not fully defined.") 
+        display_turbulence_and_regime_analysis()
 
-    # --- Populate Tab 4: Theoretical Background (This is general info) ---
     with tab4:
-        if 'display_theoretical_background' in globals():
-            display_theoretical_background()
-        else:
-            st.error("Error: The 'display_theoretical_background' function is missing or not fully defined.") 
+        display_theoretical_background()
 
-    # --- Populate Tab 5: Full Data Table (This is universe-level data) ---
     with tab5:
-        st.subheader("Full Processed Data Table")
-        if not results_df.empty:
-            st.dataframe(results_df, use_container_width=True)
-        else:
-            st.info("No processed data available.")
+        st.subheader("Processed Universe Data")
+        st.dataframe(results_df, use_container_width=True)
+
 if __name__ == "__main__":
     main()
