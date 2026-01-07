@@ -3773,7 +3773,54 @@ def get_correlated_stocks(selected_ticker, returns_dict, results_df, correlation
         logging.warning(f"Could not retrieve Relative_Z_Score for {selected_ticker} for Pairs Score calculation.")
 
     return corr_df
+def calculate_covariance_matrix(tickers, returns_dict, window=252):
+    """
+    Sophisticated Covariance Estimation:
+    1. Oracle Approximating Shrinkage (OAS)
+    2. Spectral Denoising (Eigenvalue clipping)
+    3. Tikhonov Regularization
+    """
+    n = len(tickers)
+    if n == 0 or not returns_dict:
+        return pd.DataFrame(), pd.DataFrame()
 
+    # Align and Filter Data
+    simple_rets = {t: np.expm1(returns_dict[t]) for t in tickers if t in returns_dict}
+    returns_df = pd.DataFrame(simple_rets).tail(window).dropna(axis=1, how='all').fillna(0)
+    
+    valid_tickers = returns_df.columns.tolist()
+    if len(valid_tickers) < 2:
+        identity = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
+        return identity, identity
+
+    # OAS Shrinkage
+    try:
+        model = OAS().fit(returns_df)
+        cov_matrix = model.covariance_ * 252 
+    except:
+        cov_matrix = returns_df.cov().values * 252
+        cov_matrix = (1 - 0.1) * cov_matrix + 0.1 * np.diag(np.diag(cov_matrix))
+
+    # Spectral Denoising (The MALV Fix)
+    evals, evecs = eigh(cov_matrix)
+    q = len(returns_df) / len(valid_tickers) 
+    sigma_sq = np.mean(evals) 
+    mp_threshold = sigma_sq * (1 + (1/q) + 2*np.sqrt(1/q))
+    
+    # Clip eigenvalues to ensure precision matrix stability
+    evals_denoised = np.maximum(evals, mp_threshold * 0.1) 
+    cov_denoised = evecs @ np.diag(evals_denoised) @ evecs.T
+    
+    # Final cleanup
+    cov_final = pd.DataFrame(np.eye(n) * np.mean(evals_denoised), index=tickers, columns=tickers)
+    cov_final.loc[valid_tickers, valid_tickers] = cov_denoised
+    
+    vols = np.sqrt(np.diag(cov_final.values))
+    vols[vols < 1e-8] = 1.0
+    corr_matrix = cov_final.values / np.outer(vols, vols)
+    corr_final = pd.DataFrame(corr_matrix, index=tickers, columns=tickers)
+
+    return corr_final, cov_final
 def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histories):
     """Orchestrator function to display the entire individual stock dashboard."""
     st.header(f"🔬 Detailed Dashboard for {ticker_symbol}")
@@ -3883,18 +3930,6 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
 # --- NEW FUNCTION: apply_regime_weights(...) ---
 ################################################################################
 # SECTION 2: MAIN APPLICATION LOGIC (CORRECTED)
-################################################################################
-# SECTION 2: MAIN APPLICATION LOGIC (CORRECTED WITH CACHING)
-################################################################################
-# SECTION 2: MAIN APPLICATION LOGIC (WITH INTERACTIVE PLOTS)
-################################################################################
-# SECTION 2: MAIN APPLICATION LOGIC (COMPLETE AND FINAL)
-################################################################################
-################################################################################
-# SECTION 2: MAIN APPLICATION LOGIC (COMPLETE - UNCONSTRAINED PURE ALPHA STRATEGY)
-# SECTION 2: MAIN APPLICATION LOGIC (COMPLETE, ENHANCED, AND CORRECTED)
-################################################################################
-# From SECTION 2: MAIN APPLICATION LOGIC
 def main():
     st.title("Quantitative Portfolio Analysis")
     st.sidebar.header("Controls")
@@ -3946,21 +3981,21 @@ def main():
         else:
             results_df['CS_Mean_Reversion'] = 0.0
 
-    # --- 4. EXECUTE SOPHISTICATED FACTOR ANALYSIS ---
+    # --- 4. EXECUTE SOPHISTICATED FACTOR ANALYSIS (The Brain) ---
     st.sidebar.subheader("Factor Weighting")
     with st.spinner("Executing Sophisticated Factor Analysis..."):
         all_possible_metrics = list(default_weights.keys())
         
-        # Call the Bayesian/OAS factor stability engine
+        # Call the Sophisticated engine (OAS + Bayesian Shrinkage)
         auto_weights, rationale_df, horizon_details = run_factor_stability_analysis(
             results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
         )
         
         if not rationale_df.empty:
-            # UI Direction label
+            # Map signal direction for UI
             rationale_df['Signal Direction'] = np.where(rationale_df['avg_ic'] >= 0, 'Positive ✅', 'Inverted 🔄')
             try:
-                # Rank factors by Sophistication (Information Ratio of IC)
+                # Rank factors by Alpha Quality (Information Ratio of the IC)
                 rationale_df['Alpha Quality'] = pd.qcut(rationale_df['ic_ir'].abs(), 3, labels=["Bronze", "Silver", "Gold"])
             except:
                 rationale_df['Alpha Quality'] = "Gold"
@@ -3971,10 +4006,11 @@ def main():
             active_weights = default_weights
             active_rationale = pd.DataFrame()
 
-    # --- 5. SIDEBAR RATIONALE DISPLAY ---
+    # --- 5. SIDEBAR RATIONALE DISPLAY (Fixed KeyErrors) ---
     if not active_rationale.empty:
         with st.sidebar.expander("View Factor Model Rationale", expanded=True):
             try:
+                # Columns produced by the Sophisticated Engine
                 display_cols = ['ic_ir', 'consistency', 'Signal Direction', 'Alpha Quality']
                 display_df = active_rationale[display_cols].copy()
                 display_df.columns = ['Alpha Sharpe', 'Stability', 'Direction', 'Tier']
@@ -3989,110 +4025,128 @@ def main():
                     use_container_width=True
                 )
             except KeyError as e:
-                st.error(f"UI Display Error: {e}")
+                st.error(f"UI Column Error: Missing {e}")
 
     # --- 6. ALPHA SCORING (Unconstrained Pure Alpha) ---
     alpha_score = pd.Series(0.0, index=results_df.index)
-    if active_weights:
+    if not results_df.empty and active_weights:
         for long_name, weight in active_weights.items():
             if weight > 0:
                 short_name = REVERSE_METRIC_NAME_MAP.get(long_name)
                 if short_name in results_df.columns:
-                    # Automatically determine rank direction from the Factor Brain
-                    avg_ic_dir = active_rationale.loc[short_name, 'avg_ic'] if short_name in active_rationale.index else 1.0
+                    # Automatically determine rank direction from the Factor Brain's average IC
+                    avg_ic_dir = active_rationale.loc[short_name, 'avg_ic'] if short_name in active_rationale.index else 0.0
                     rank_ascending = (avg_ic_dir >= 0)
                     alpha_score += results_df[short_name].rank(pct=True, ascending=rank_ascending).fillna(0.5) * weight
 
-        # Standardize for the quantitative dashboard
+        # Standardize via robust Z-score for the final ranking
         med = alpha_score.median()
         mad = (alpha_score - med).abs().median()
         results_df['Score'] = 0.6745 * (alpha_score - med) / (mad if mad > 0 else 1.0)
     
+    # Filter for the top 15 candidates
     top_15_df = results_df.sort_values('Score', ascending=False).head(15).copy()
     top_15_tickers = top_15_df['Ticker'].tolist()
 
-    # --- 7. SOPHISTICATED PORTFOLIO CONSTRUCTION ---
+    # --- 7. SOPHISTICATED PORTFOLIO CONSTRUCTION (Denoised Matrix) ---
     st.header("📈 Portfolio Overview & Hedging")
     if not top_15_tickers:
-        st.warning("Strategy yielded no investable tickers."); st.stop()
+        st.warning("The strategy yielded no investable tickers."); st.stop()
 
-    # Convert log to simple returns for variance/covariance logic
+    # Convert log returns back to simple returns for variance/covariance calculations
     simple_rets_dict = {t: np.expm1(rets) for t, rets in winsorized_returns_dict.items()}
     portfolio_returns_df = pd.DataFrame(simple_rets_dict).reindex(columns=top_15_tickers).dropna(how='all')
 
-    # Denoised Covariance Matrix (OAS + Spectral Denoising)
+    # Apply Sophisticated Denoised Covariance Matrix (OAS + Spectral Denoising)
     _, cov_matrix = calculate_covariance_matrix(top_15_tickers, winsorized_returns_dict, window=corr_window)
     
     method_map = {"Equal Weight": "equal", "Inverse Volatility": "inv_vol", "Log Log Sharpe Optimized": "log_log_sharpe"}
     p_weights = calculate_weights(portfolio_returns_df, method=method_map.get(weighting_method_ui), cov_matrix=cov_matrix)
     
+    if p_weights.empty:
+        st.error("Weight optimization failed."); st.stop()
+
     weights_df = p_weights.reset_index()
     weights_df.columns = ['Ticker', 'Weight']
     weights_df = pd.merge(weights_df, top_15_df[['Ticker', 'Name', 'Sector']], on='Ticker', how='left')
     st.dataframe(weights_df[['Ticker', 'Name', 'Weight']].sort_values("Weight", ascending=False), use_container_width=True)
 
-    # --- 8. ROBUST HEDGING LOGIC ---
+    # --- 8. SCALED ROBUST HEDGING ---
     hedge_weights = pd.Series(dtype=float)
     if hedge_risks and not portfolio_returns_df.empty:
-        with st.spinner(f"Calculating robust, regime-aware hedge for {', '.join(hedge_risks)}..."):
-            hedge_instrument_returns_dict = {
+        with st.spinner(f"Calculating robust hedge for {', '.join(hedge_risks)}..."):
+            hedge_rets_dict = {
                 etf: etf_histories[etf]['Close'].pct_change(fill_method=None).dropna() 
-                for etf in hedge_risks 
-                if etf in etf_histories and not etf_histories[etf].empty
+                for etf in hedge_risks if etf in etf_histories and not etf_histories[etf].empty
             }
-            if hedge_instrument_returns_dict:
-                hedge_instrument_returns_df = pd.DataFrame(hedge_instrument_returns_dict)
-                common_idx = portfolio_returns_df.index.intersection(hedge_instrument_returns_df.index)
+            if hedge_rets_dict:
+                hedge_rets_df = pd.DataFrame(hedge_rets_dict)
+                common_idx = portfolio_returns_df.index.intersection(hedge_rets_df.index)
                 
                 if len(common_idx) > 30:
                     aligned_p_rets = (portfolio_returns_df.loc[common_idx] * p_weights).sum(axis=1)
-                    aligned_hedge_rets = hedge_instrument_returns_df.loc[common_idx]
+                    aligned_hedge_rets = hedge_rets_df.loc[common_idx]
                     
-                    # Core robust hedging call
+                    # Call robust hedge weights
                     raw_hedge_weights = calculate_robust_hedge_weights(
                         aligned_p_rets.to_frame('Portfolio'), 
                         aligned_hedge_rets, 
                         lambda_uncertainty=lambda_uncertainty_ui
                     )
                     
-                    # Scaling factor for Net Exposure (Target = Long + (HedgeSum * Scale))
+                    # Scaling for target exposure: Net = Long + (HedgeSum * Scale)
                     long_exposure = 1.0
                     raw_hedge_sum = raw_hedge_weights.sum()
                     if abs(raw_hedge_sum) > 1e-5:
                         k_scale = (target_net_exposure_ui - long_exposure) / raw_hedge_sum
                         hedge_weights = raw_hedge_weights * k_scale
                     else:
-                        hedge_weights = raw_hedge_weights # No scaling if weights are 0
+                        hedge_weights = raw_hedge_weights
 
     if not hedge_weights.empty:
         st.subheader("Final Hedging Allocation")
-        h_df = hedge_weights.reset_index()
-        h_df.columns = ['Instrument', 'Weight']
-        st.dataframe(h_df[abs(h_df['Weight']) > 1e-4].style.format({'Weight': '{:.2%}'}), use_container_width=True)
+        h_disp = hedge_weights.reset_index()
+        h_disp.columns = ['Instrument', 'Weight']
+        st.dataframe(h_disp[abs(h_disp['Weight']) > 1e-4].style.format({'Weight': '{:.2%}'}), use_container_width=True)
         
         c1, c2, c3 = st.columns(3)
         c1.metric("Long Exposure", "100.0%")
-        c2.metric("Short Exposure", f"{abs(min(0, hedge_weights.sum())):.1%}")
+        c2.metric("Short Exposure (Hedge)", f"{abs(min(0, hedge_weights.sum())):.1%}")
         c3.metric("Net Exposure", f"{(1.0 + hedge_weights.sum()):.1%}")
-    else:
-        st.info("No active hedge positions.")
 
-    # --- 9. QUANTITATIVE PERFORMANCE DASHBOARD ---
+    st.divider()
+
+    # --- 9. QUANTITATIVE RISK & PERFORMANCE DASHBOARD ---
     spy_simple = etf_histories['SPY']['Close'].pct_change(fill_method=None).dropna()
-    common = portfolio_returns_df.index.intersection(spy_simple.index)
-    if not common.empty:
-        # Annualized Stats
-        p_rets = (portfolio_returns_df.loc[common] * p_weights).sum(axis=1)
-        ic_val, ir_val = calculate_information_metrics(p_rets.shift(1), p_rets, spy_simple.loc[common])
-        malv_val, _ = calculate_mahalanobis_metrics(portfolio_returns_df.loc[common], cov_matrix)
+    common_stats_idx = portfolio_returns_df.index.intersection(spy_simple.index)
+    
+    if not common_stats_idx.empty:
+        p_rets = (portfolio_returns_df.loc[common_stats_idx] * p_weights).sum(axis=1)
+        ic_val, ir_val = calculate_information_metrics(p_rets.shift(1), p_rets, spy_simple.loc[common_stats_idx])
+        malv_val, _ = calculate_mahalanobis_metrics(portfolio_returns_df.loc[common_stats_idx], cov_matrix)
         
-        st.subheader("Strategy Risk Metrics")
+        # Benchmarking for TWR
+        bench_stats = get_benchmark_metrics()
+        avg_idio = calculate_idio_variance_single_stock(winsorized_returns_dict, np.log1p(spy_simple))
+        
+        st.subheader("🔬 Quantitative Strategy Dashboard")
         col1, col2, col3 = st.columns(3)
         col1.metric("Matrix Quality (MALV)", f"{malv_val:.4f}", help="Fixed by Spectral Denoising. Target > 0.05")
         col2.metric("Information Coefficient (IC)", f"{ic_val:.4f}")
         col3.metric("Information Ratio (IR)", f"{ir_val:.4f}")
 
-    # --- 10. THE FULL 5-TAB INTERFACE ---
+        # TWR Wealth Projection
+        if pd.notna(ir_val) and pd.notna(avg_idio):
+            twr_val, prob_loss = calculate_terminal_wealth_metrics(
+                portfolio_sharpe=ir_val,
+                benchmark_sharpe=bench_stats.get('Sharpe Ratio', 0.5),
+                port_idio_var_n1_avg=avg_idio,
+                num_port_stocks=len(top_15_tickers),
+                leverage_f=(1.0 + hedge_weights.sum())
+            )
+            st.write(f"**Expected Terminal Wealth (5Y):** {twr_val:.2f}x | **Prob. Underperforming:** {prob_loss:.1%}")
+
+    # --- 10. FIVE-TAB INTERFACE ---
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "🔬 Stock Dashboard", 
         "🛄 Factor Analysis", 
@@ -4103,16 +4157,16 @@ def main():
 
     with tab1:
         ticker_list = sorted(results_df['Ticker'].unique().tolist())
-        selected_ticker = st.sidebar.selectbox("Select Ticker for Analysis", options=ticker_list)
-        display_stock_dashboard(selected_ticker, results_df, winsorized_returns_dict, etf_histories)
-        display_deep_dive_data(selected_ticker)
+        sel_ticker = st.sidebar.selectbox("Deep Dive Ticker", options=ticker_list)
+        display_stock_dashboard(sel_ticker, results_df, winsorized_returns_dict, etf_histories)
+        display_deep_dive_data(sel_ticker)
 
     with tab2:
-        st.subheader("Sophisticated Factor Stability Results")
+        st.subheader("Factor Stability Rationale")
         st.dataframe(active_rationale.style.format({'ic_ir': '{:.2f}', 'consistency': '{:.1%}', 'Final_Weight': '{:.1f}'}))
-        for h, h_df in horizon_details.items():
-            with st.expander(f"Horizon Raw ICs: {h}"):
-                st.dataframe(h_df.sort_values(ascending=False, key=abs))
+        for hor, h_df in horizon_details.items():
+            with st.expander(f"Raw IC Data: {hor}"):
+                st.dataframe(h_df)
 
     with tab3:
         display_turbulence_and_regime_analysis()
@@ -4121,7 +4175,7 @@ def main():
         display_theoretical_background()
 
     with tab5:
-        st.subheader("Processed Universe Data")
+        st.subheader("Processed Universe Snapshot")
         st.dataframe(results_df, use_container_width=True)
 
 if __name__ == "__main__":
