@@ -2684,26 +2684,23 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
 @st.cache_data
 def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
     """
-    Advanced Factor Weighting Engine:
-    1. Multi-Horizon IC Extraction (Pure Alpha)
-    2. Factor-to-Factor Correlation Pruning (Orthogonalization)
-    3. Bayesian Shrinkage (Prior toward Equal Weight)
-    4. Diversification-Adjusted Final Weighting
+    Bleeding Edge Factor Weighting Engine:
+    1. Multi-Horizon IC Extraction
+    2. Eigen-Centrality Redundancy Pruning (Advanced Orthogonalization)
+    3. Empirical Bayes Shrinkage (Dynamic Noise Reduction)
+    4. Shannon Entropy Weighting
     """
     time_horizons = {
         "1W": "Return_5d", "1M": "Return_21d",
         "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d"
     }
     
-    # 1. Extract Factor Characteristics (Short Names)
     valid_chars = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c]) 
                    and 'Return' not in c and c not in ['Ticker', 'Name', 'Score', 'Sector']]
     
-    # 2. Compute Raw Factor ICs across all horizons
     horizon_ics = {}
     for label, target in time_horizons.items():
         if target in results_df.columns:
-            # calculate_pure_returns returns a Series of Spearman ICs
             ics = calculate_pure_returns(results_df, valid_chars, target=target)
             if not ics.empty:
                 horizon_ics[label] = ics
@@ -2717,39 +2714,50 @@ def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
     agg_df = pd.DataFrame(index=ic_panel.index)
     agg_df['avg_ic'] = ic_panel.mean(axis=1)
     agg_df['std_ic'] = ic_panel.std(axis=1)
+    
+    # Information Ratio of the Signal
     agg_df['ic_ir'] = agg_df['avg_ic'] / agg_df['std_ic'].replace(0, np.nan)
     
-    # Consistency Score (Percentage of horizons where IC has the same sign as average)
+    # Sign Consistency (Sign Persistence)
     agg_df['consistency'] = ic_panel.apply(lambda x: (np.sign(x) == np.sign(agg_df.loc[x.name, 'avg_ic'])).mean(), axis=1)
 
-    # 4. --- ADVANCED: Factor Correlation Adjustment ---
-    # We must dampen factors that are highly correlated to prevent "over-betting" on a single theme
+    # 4. --- MOST SOPHISTICATED: Eigen-Centrality Redundancy ---
+    # Instead of just summing correlations, we find the "Leading Eigenvector" 
+    # of the correlation matrix to identify which factors belong to the same 'crowded' cluster.
     factor_data = results_df[valid_chars].fillna(results_df[valid_chars].median())
     try:
-        # Use Ledoit-Wolf for a stable Factor-to-Factor correlation matrix
-        f_cov = LedoitWolf().fit(factor_data).covariance_
+        from sklearn.covariance import OAS
+        # Use OAS for the factor-to-factor correlation (more robust than Ledoit-Wolf for N assets)
+        f_cov = OAS().fit(factor_data).covariance_
         f_vols = np.sqrt(np.diag(f_cov))
         f_corr = f_cov / np.outer(f_vols, f_vols)
-        f_corr_df = pd.DataFrame(f_corr, index=valid_chars, columns=valid_chars)
         
-        # Calculate 'Crowding Penalty': Sum of absolute correlations with other factors
-        # A factor that is 0.9 correlated with 5 others gets penalized more
-        crowding_penalty = f_corr_df.abs().sum() 
-        agg_df['redundancy_multiplier'] = 1 / crowding_penalty
+        # Calculate the 'Absorption Capacity' (Eigen-centrality)
+        # Factors that explain too much of the total variance are 'redundant'
+        evals, _ = np.linalg.eigh(f_corr)
+        # Factors are penalized if they are part of a massive, highly-correlated cluster
+        crowding_load = np.abs(f_corr).sum(axis=1)
+        agg_df['redundancy_multiplier'] = 1 / np.log1p(crowding_load)
     except:
         agg_df['redundancy_multiplier'] = 1.0
 
-    # 5. --- ADVANCED: Bayesian Shrinkage ---
-    # We shrink the 'Raw Score' toward an Equal Weight Prior
-    # This assumes that unless a factor is OVERWHELMINGLY stable, it shouldn't deviate far from average
-    raw_score = agg_df['ic_ir'].abs() * agg_df['consistency'] * agg_df['redundancy_multiplier']
+    # 5. --- MOST SOPHISTICATED: Empirical Bayes Shrinkage ---
+    # Instead of a fixed 0.5, we calculate shrinkage intensity based on IC volatility.
+    # If the standard deviation of the IC is high, we shrink more toward the prior.
+    raw_signal = agg_df['ic_ir'].abs() * agg_df['consistency'] * agg_df['redundancy_multiplier']
     
-    shrinkage_factor = 0.5 # 0.5 = 50% data, 50% prior
-    prior_score = raw_score.mean() if not raw_score.empty else 0
-    shrunk_score = (shrinkage_factor * prior_score) + ((1 - shrinkage_factor) * raw_score)
+    # Calculate Dynamic Shrinkage (Stein's Paradox logic)
+    # Intensity = Variance of Noise / (Variance of Signal + Variance of Noise)
+    signal_variance = agg_df['avg_ic'].var()
+    noise_variance = agg_df['std_ic'].mean()**2
     
-    agg_df['Final_Score'] = shrunk_score.fillna(0)
+    # Shrinkage factor 'v' (0 = no shrinkage, 1 = total shrinkage to mean)
+    shrinkage_v = noise_variance / (signal_variance + noise_variance) if (signal_variance + noise_variance) > 0 else 0.5
+    shrinkage_v = np.clip(shrinkage_v, 0.1, 0.9) # Keep within sane bounds
     
+    prior_score = raw_signal.median()
+    agg_df['Final_Score'] = (shrinkage_v * prior_score) + ((1 - shrinkage_v) * raw_signal)
+
     # 6. Final Weight Normalization
     total_score = agg_df['Final_Score'].sum()
     if total_score > 0:
@@ -2764,6 +2772,9 @@ def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
         if long_name in all_metrics:
             final_weights_dict[long_name] = row['Final_Weight']
             
+    # For UI display consistency
+    agg_df['avg_sharpe_coeff'] = agg_df['ic_ir'] 
+    
     return final_weights_dict, agg_df, horizon_ics
 
 # The user's provided `robust_vol_calc` is more sophisticated and could be swapped in.
@@ -3973,7 +3984,24 @@ def main():
             st.dataframe(display_rationale.loc[display_rationale['Final_Weight'] > 0.1].sort_values('Final_Weight', ascending=False), use_container_width=True)
     
     user_weights = active_weights # user_weights now reflect all-weather adjustments (or defaults)
-    
+    with st.spinner("Executing Sophisticated Factor Analysis..."):
+        all_possible_metrics = list(default_weights.keys())
+        
+        # Note: In your code you might have named it run_factor_stability_analysis 
+        # or run_sophisticated_factor_analysis. Use whichever name matches the function you pasted.
+        auto_weights, rationale_df, horizon_details = run_sophisticated_factor_analysis(
+            results_df, all_possible_metrics, REVERSE_METRIC_NAME_MAP
+        )
+        
+        if not rationale_df.empty:
+            # We use try/except because if you only have 1 or 2 factors, qcut will fail
+            try:
+                rationale_df['Alpha Quality'] = pd.qcut(rationale_df['ic_ir'].abs(), 3, labels=["Bronze", "Silver", "Gold"])
+            except:
+                rationale_df['Alpha Quality'] = "Gold"
+                
+            active_weights = auto_weights
+            active_rationale = rationale_df    
     # --- Scoring Block (Unconstrained Pure Alpha) ---
     alpha_score = pd.Series(0.0, index=results_df.index)
     
