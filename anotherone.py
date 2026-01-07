@@ -3773,7 +3773,7 @@ def get_correlated_stocks(selected_ticker, returns_dict, results_df, correlation
         logging.warning(f"Could not retrieve Relative_Z_Score for {selected_ticker} for Pairs Score calculation.")
 
     return corr_df
-def calculate_covariance_matrix(tickers, returns_dict, window=252):
+def calculate_covariance_matrix(tickers, returns_dict, window=90):
     """
     Sophisticated Covariance Estimation:
     1. Oracle Approximating Shrinkage (OAS)
@@ -3796,9 +3796,9 @@ def calculate_covariance_matrix(tickers, returns_dict, window=252):
     # OAS Shrinkage
     try:
         model = OAS().fit(returns_df)
-        cov_matrix = model.covariance_ * 252 
+        cov_matrix = model.covariance_ * 90
     except:
-        cov_matrix = returns_df.cov().values * 252
+        cov_matrix = returns_df.cov().values * 90
         cov_matrix = (1 - 0.1) * cov_matrix + 0.1 * np.diag(np.diag(cov_matrix))
 
     # Spectral Denoising (The MALV Fix)
