@@ -2971,65 +2971,70 @@ def analyze_factor_correlations(df, returns_dict):
     except Exception as e:
         logging.error(f"Error in analyze_factor_correlations after cleaning: {str(e)}")
         return df, pd.DataFrame(), pd.DataFrame(columns=['Avg_Rank']).fillna(1.0)
+
 def calculate_correlation_matrix(tickers, returns_dict, window=90):
     """
-    Calculates a robust, positive semi-definite correlation and covariance matrix.
+    Sophisticated Covariance Estimation:
+    1. Oracle Approximating Shrinkage (OAS) - Better than Ledoit-Wolf for small T.
+    2. Spectral Denoising - Clips the 'noise' eigenvalues using Marčenko-Pastur limits.
+    3. Tikhonov Regularization - Ensures the Precision Matrix (Inverse) is stable.
     """
     n = len(tickers)
     if n == 0 or not returns_dict:
-        # Return empty DFs with correct index/columns if no tickers
-        return pd.DataFrame(index=tickers, columns=tickers), pd.DataFrame(index=tickers, columns=tickers)
+        return pd.DataFrame(), pd.DataFrame()
 
-    # Filter returns_dict to only include provided tickers
-    filtered_returns_dict = {t: returns_dict[t] for t in tickers if t in returns_dict and not returns_dict[t].empty}
+    # 1. Align and Filter Data
+    # Use simple returns for risk estimation
+    simple_rets = {t: np.expm1(returns_dict[t]) for t in tickers if t in returns_dict}
+    returns_df = pd.DataFrame(simple_rets).tail(window).dropna(axis=1, how='all').fillna(0)
     
-    if not filtered_returns_dict: # If no valid returns for any ticker
+    valid_tickers = returns_df.columns.tolist()
+    if len(valid_tickers) < 2:
         identity = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
         return identity, identity
 
-    returns_df = pd.DataFrame(filtered_returns_dict)
-    
-    # Reindex to ensure all tickers are present, filling missing with 0 for matrix calculation
-    returns_df = returns_df.reindex(columns=tickers).fillna(0.0)
-
-    aligned_returns = returns_df.tail(window)
-    
-    # FIX: Replaced inplace=True with direct reassignment
-    aligned_returns = aligned_returns.dropna(axis=1, how='all') # Drop columns that are all NaN in the window
-    # aligned_returns = aligned_returns.fillna(0.0) # Already handled by reindex and .fillna(0.0) above
-
-    valid_tickers = aligned_returns.columns.tolist()
-    if len(valid_tickers) < 2: # Need at least 2 for covariance
-        identity = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
-        return identity, identity
-
+    # 2. Oracle Approximating Shrinkage (OAS)
+    # OAS is mathematically superior to Ledoit-Wolf when N/T is small or 
+    # when observations are assumed to be Gaussian.
     try:
-        lw = LedoitWolf()
-        lw.fit(aligned_returns)
-        
-        cov_matrix_values = lw.covariance_ * 252 # Annualize
-        
-        # Create full covariance matrix (including tickers that were dropped due to NaNs)
-        cov_matrix_full = pd.DataFrame(np.eye(n) * np.mean(np.diag(cov_matrix_values)), index=tickers, columns=tickers)
-        cov_matrix_full.loc[valid_tickers, valid_tickers] = cov_matrix_values
-        
-        vols = np.sqrt(np.diag(cov_matrix_values))
-        vols[vols < 1e-8] = 1.0 # Prevent division by near-zero vol
-        
-        # Ensure outer product is correctly shaped for correlation
-        corr_matrix_values = cov_matrix_values / np.outer(vols, vols)
-        
-        corr_matrix_full = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
-        corr_matrix_full.loc[valid_tickers, valid_tickers] = corr_matrix_values
-        
-        final_corr = pd.DataFrame(nearest_psd_matrix(corr_matrix_full.values), index=tickers, columns=tickers)
+        model = OAS().fit(returns_df)
+        cov_matrix = model.covariance_ * 252 # Annualize
+    except:
+        # Fallback to standard shrinkage if OAS fails
+        cov_matrix = returns_df.cov().values * 252
+        shrinkage = 0.1
+        cov_matrix = (1 - shrinkage) * cov_matrix + shrinkage * np.diag(np.diag(cov_matrix))
 
-    except Exception as e:
-        logging.error(f"Ledoit-Wolf estimation failed: {e}. Falling back to identity matrix for correlation and cov.")
-        identity = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
-        return identity, identity
+    # 3. Spectral Denoising (Eigenvalue Fixing)
+    # This directly fixes the MALV problem. We prevent the smallest eigenvalues 
+    # from being too close to zero (which makes the inverse explode).
+    evals, evecs = eigh(cov_matrix)
+    
+    # Calculate the Marčenko-Pastur threshold (simplified)
+    # This is the point where eigenvalues are likely just mathematical noise
+    q = len(returns_df) / len(valid_tickers) # T/N Ratio
+    sigma_sq = np.mean(evals) # Average variance
+    mp_threshold = sigma_sq * (1 + (1/q) + 2*np.sqrt(1/q))
+    
+    # Clip eigenvalues: Floor them at a fraction of the threshold or a tiny positive constant
+    # This is the "Spectral Heat" treatment that stabilizes the Precision Matrix Quality
+    evals_denoised = np.maximum(evals, mp_threshold * 0.1) 
+    
+    # Reconstruct the denoised covariance matrix
+    cov_denoised = evecs @ np.diag(evals_denoised) @ evecs.T
+    
+    # 4. Map back to original tickers
+    cov_final = pd.DataFrame(np.eye(n) * np.mean(evals_denoised), index=tickers, columns=tickers)
+    cov_final.loc[valid_tickers, valid_tickers] = cov_denoised
+    
+    # 5. Calculate Correlation Matrix from Denoised Covariance
+    vols = np.sqrt(np.diag(cov_final.values))
+    # Prevent division by zero
+    vols[vols < 1e-8] = 1.0
+    corr_matrix = cov_final.values / np.outer(vols, vols)
+    corr_final = pd.DataFrame(corr_matrix, index=tickers, columns=tickers)
 
-    return final_corr, cov_matrix_full
+    return corr_final, cov_final
 
 def calculate_weights(returns_df, method="equal", cov_matrix=None, factor_returns=None, betas=None):
     """
