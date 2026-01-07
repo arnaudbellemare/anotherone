@@ -27,6 +27,8 @@ import statsmodels.tsa.stattools as smt
 import plotly.express as px
 import pandas_datareader.data as web
 from hmmlearn.hmm import GaussianHMM
+from sklearn.covariance import OAS
+from scipy.linalg import eigh
 import statsmodels.tsa.api as sm
 # Add these to your main script's import section
 import arch
