@@ -3680,55 +3680,59 @@ def calculate_terminal_wealth_metrics(
     return twr, prob_losing
 def get_correlated_stocks(selected_ticker, returns_dict, results_df, correlation_threshold=0.40):
     """
-    Finds other tickers correlated with the selected ticker. If a threshold is provided,
-    it filters by correlation first. It enriches the data and calculates a pairs score.
+    Finds other tickers correlated with the selected ticker. 
+    Guarantees the existence of 'Pairs_Score' to prevent KeyErrors.
     """
-    if selected_ticker not in returns_dict or len(returns_dict) < 2: # Added robustness check
-        return pd.DataFrame()
+    # 1. Basic Safety Check
+    if selected_ticker not in returns_dict or len(returns_dict) < 2:
+        return pd.DataFrame(columns=['Correlation', 'Pairs_Score', 'Relative_Z_Score', 'PE_Ratio', 'Return_63d'])
 
     try:
         all_returns_df = pd.concat(returns_dict, axis=1)
-    except Exception as e:
-        logging.error(f"Failed to concat returns_dict: {e}"); return pd.DataFrame()
-
-    recent_returns = all_returns_df.tail(90).fillna(0.0)
-    if selected_ticker not in recent_returns.columns: return pd.DataFrame()
-
-    correlations_to_selected = recent_returns.corr()[selected_ticker].drop(selected_ticker, errors='ignore')
-    
-    # --- KEY CHANGE: Conditional Filtering ---
-    if correlation_threshold is not None: # User can pass None to get all correlations
-        # If a threshold is given, filter for high correlation first
-        corr_df = correlations_to_selected[correlations_to_selected.abs() >= correlation_threshold].to_frame()
-    else:
-        # Otherwise, consider all stocks
-        corr_df = correlations_to_selected.to_frame()
-
-    if corr_df.empty: return pd.DataFrame()
+        recent_returns = all_returns_df.tail(90).fillna(0.0)
         
-    corr_df = corr_df.rename(columns={selected_ticker: 'Correlation'})
+        if selected_ticker not in recent_returns.columns:
+            return pd.DataFrame(columns=['Correlation', 'Pairs_Score'])
 
-    # Enrich with additional data
-    required_cols = ['Ticker', 'Relative_Z_Score', 'PE_Ratio', 'Return_63d']
-    # Check if results_df actually has these columns before trying to access
-    if all(col in results_df.columns for col in required_cols):
-        additional_info = results_df[required_cols].set_index('Ticker')
-        # Use .join safely, ensuring only common indices are joined
-        corr_df = corr_df.join(additional_info, how='left') # Changed to left join to keep all correlations
+        correlations_to_selected = recent_returns.corr()[selected_ticker].drop(selected_ticker, errors='ignore')
+        
+        # Filter by threshold if provided
+        if correlation_threshold is not None:
+            corr_df = correlations_to_selected[correlations_to_selected.abs() >= correlation_threshold].to_frame()
+        else:
+            corr_df = correlations_to_selected.to_frame()
 
-    # Calculate the Pairs Trade Score
-    # Ensure selected_stock_z_score is retrieved safely
-    selected_stock_data = results_df[results_df['Ticker'] == selected_ticker].set_index('Ticker')
-    if not selected_stock_data.empty and 'Relative_Z_Score' in selected_stock_data.columns:
-        selected_stock_z_score = selected_stock_data.loc[selected_ticker, 'Relative_Z_Score']
-        corr_df['Z_Score_Divergence'] = (corr_df['Relative_Z_Score'] - selected_stock_z_score).abs()
-        corr_df['Pairs_Score'] = corr_df['Correlation'].abs() * corr_df['Z_Score_Divergence']
-    else:
-        corr_df['Z_Score_Divergence'] = np.nan
+        if corr_df.empty:
+            return pd.DataFrame(columns=['Correlation', 'Pairs_Score'])
+
+        corr_df = corr_df.rename(columns={selected_ticker: 'Correlation'})
+        
+        # --- CRITICAL FIX: Initialize columns so they ALWAYS exist ---
         corr_df['Pairs_Score'] = np.nan
-        logging.warning(f"Could not retrieve Relative_Z_Score for {selected_ticker} for Pairs Score calculation.")
+        corr_df['Z_Score_Divergence'] = np.nan
 
-    return corr_df
+        # 2. Enrich with additional data
+        required_cols = ['Ticker', 'Relative_Z_Score', 'PE_Ratio', 'Return_63d']
+        if all(col in results_df.columns for col in required_cols):
+            additional_info = results_df[required_cols].set_index('Ticker')
+            corr_df = corr_df.join(additional_info, how='left')
+
+        # 3. Calculate Pairs Trade Score
+        selected_stock_data = results_df[results_df['Ticker'] == selected_ticker].set_index('Ticker')
+        
+        if not selected_stock_data.empty and 'Relative_Z_Score' in selected_stock_data.columns:
+            selected_stock_z = selected_stock_data.loc[selected_ticker, 'Relative_Z_Score']
+            
+            # Ensure Relative_Z_Score is present in the joined dataframe
+            if 'Relative_Z_Score' in corr_df.columns:
+                corr_df['Z_Score_Divergence'] = (corr_df['Relative_Z_Score'] - selected_stock_z).abs()
+                corr_df['Pairs_Score'] = corr_df['Correlation'].abs() * corr_df['Z_Score_Divergence']
+
+        return corr_df
+
+    except Exception as e:
+        logging.error(f"Error in get_correlated_stocks: {e}")
+        return pd.DataFrame(columns=['Correlation', 'Pairs_Score'])
 def calculate_covariance_matrix(tickers, returns_dict, window=90):
     """
     Sophisticated Covariance Estimation:
@@ -3780,30 +3784,42 @@ def calculate_covariance_matrix(tickers, returns_dict, window=90):
 
     return corr_final, cov_final
 def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histories):
-    """Orchestrator function to display the entire individual stock dashboard."""
+    """
+    Orchestrator function to display the entire individual stock dashboard.
+    Robustly handles Peer Analysis and Sorting to prevent KeyErrors.
+    """
     st.header(f"🔬 Detailed Dashboard for {ticker_symbol}")
+    
     try:
-        daily_history = yf.Ticker(ticker_symbol).history(period="3y", auto_adjust=True, interval="1d").tz_localize(None) # Added tz_localize(None)
-        if daily_history.empty: # Added robustness check
+        # Fetch high-resolution history for technicals
+        ticker_obj = yf.Ticker(ticker_symbol)
+        daily_history = ticker_obj.history(period="3y", auto_adjust=True, interval="1d").tz_localize(None)
+        
+        if daily_history.empty:
             st.warning("Could not fetch detailed daily history for this ticker.")
             return
         
-        # Ensure the ticker is in results_df before trying to access iloc[0]
+        # Pull processed fundamental/quant data from the results universe
         stock_data_row = results_df[results_df['Ticker'] == ticker_symbol]
         if stock_data_row.empty:
-            st.error(f"Stock data for {ticker_symbol} not found in the processed results.")
+            st.error(f"Stock data for {ticker_symbol} not found in processed results.")
             return
         stock_data = stock_data_row.iloc[0].to_dict()
+        
     except Exception as e:
         st.error(f"Error fetching data for dashboard: {e}")
         return
 
+    # 1. Timing and Quality Checklist
     if 'display_signal_sigma_checklist' in globals():
         display_signal_sigma_checklist(stock_data, daily_history)
         st.divider()
 
+    # 2. Layout: Left Column (Technicals) | Right Column (Peer Analysis)
     col1, col2 = st.columns([1.2, 0.8])
+    
     with col1:
+        # Gauges and Technical Indicators
         display_ma_deviation(daily_history)
         
         c1_tech, c2_tech, c3_tech = st.columns(3)
@@ -3813,28 +3829,27 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
         with c2_tech:
             st.metric("Medium-Term Trend", trend_str)
         with c3_tech:
-            hurst_value = stock_data.get('Hurst_Exponent')
-            if pd.notna(hurst_value):
-                hurst_interpretation = "Trending" if hurst_value > 0.55 else "Mean-Reverting" if hurst_value < 0.45 else "Random"
-                st.metric("Hurst Exponent", f"{hurst_value:.3f}", delta=hurst_interpretation, delta_color="off")
+            hurst_val = stock_data.get('Hurst_Exponent')
+            if pd.notna(hurst_val):
+                hurst_label = "Trending" if hurst_val > 0.55 else "Mean-Reverting" if hurst_val < 0.45 else "Random"
+                st.metric("Hurst Exponent", f"{hurst_val:.3f}", delta=hurst_label, delta_color="off")
             else:
                 st.metric("Hurst Exponent", "N/A")
 
         st.subheader("Daily Risk Range (ATR-based)")
-        risk_low, risk_high, last_price, pct_change = get_daily_risk_range(daily_history)
-        if not pd.isna(risk_low):
+        risk_low, risk_high, last_p, pct_chg = get_daily_risk_range(daily_history)
+        if pd.notna(risk_low):
             c1_atr, c2_atr, c3_atr = st.columns(3)
-            c1_atr.metric("Low", f"${risk_low:,.2f}")
-            c2_atr.metric("Last", f"${last_price:,.2f}", f"{pct_change:.2f}%")
-            c3_atr.metric("High", f"${risk_high:,.2f}")
+            c1_atr.metric("ATR Low", f"${risk_low:,.2f}")
+            c2_atr.metric("Last", f"${last_p:,.2f}", f"{pct_chg:.2f}%")
+            c3_atr.metric("ATR High", f"${risk_high:,.2f}")
         else:
-            st.info("Not enough data for ATR calculation.")
+            st.info("Insufficient data for ATR risk range.")
         
         display_momentum_bar(ticker_symbol, daily_history)
 
-
     with col2:
-        st.subheader(f"Actionable Peer Analysis (90d)")
+        st.subheader("Actionable Peer Analysis (90d)")
         
         sort_by = st.radio(
             "Sort Peers By:",
@@ -3843,47 +3858,48 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
             label_visibility="collapsed"
         )
         
-        # --- KEY CHANGE: Dynamic Function Calls and Sorting ---
+        # Logic to determine which columns we are targeting
         if sort_by == 'Pairs Score (Best Opportunities)':
-            # Call the function WITHOUT a threshold to search the whole market
-            # Added `returns_dict` to the function call as it's required for `get_correlated_stocks`
-            correlated_stocks_df = get_correlated_stocks(ticker_symbol, returns_dict, results_df, correlation_threshold=None) # Passed None to search whole market
-            # Sort the full results by the Pairs Score
-            final_df = correlated_stocks_df.sort_values('Pairs_Score', ascending=False).head(15) # Show top 15 opportunities
-        else: # Sort by Correlation
-            # Call the function WITH a threshold to find only true peers
+            # Search whole market (threshold=None) for divergence opportunities
+            correlated_stocks_df = get_correlated_stocks(ticker_symbol, returns_dict, results_df, correlation_threshold=None)
+            sort_key = 'Pairs_Score'
+        else:
+            # Search for high-correlation (threshold=0.6) peers
             correlated_stocks_df = get_correlated_stocks(ticker_symbol, returns_dict, results_df, correlation_threshold=0.6)
-            # Sort the filtered results by Correlation
-            final_df = correlated_stocks_df.sort_values('Correlation', key=abs, ascending=False).head(15) # Show top 15 peers
+            sort_key = 'Correlation'
 
-        if not final_df.empty:
-            display_cols = [
-                'Correlation', 
-                'Relative_Z_Score', 
-                'PE_Ratio', 
-                'Return_63d',
-                'Pairs_Score'
-            ]
+        # --- SOPHISTICATED SAFETY CHECK: Prevent KeyError 'Pairs_Score' ---
+        if not correlated_stocks_df.empty and sort_key in correlated_stocks_df.columns:
+            
+            # Ensure we only try to sort if there are non-NaN values to look at
+            if correlated_stocks_df[sort_key].notna().any():
+                final_df = correlated_stocks_df.sort_values(sort_key, ascending=False).head(15)
+            else:
+                final_df = correlated_stocks_df.head(15)
+
+            display_cols = ['Correlation', 'Relative_Z_Score', 'PE_Ratio', 'Return_63d', 'Pairs_Score']
+            # Filter display_cols to only those that exist in final_df
+            valid_display_cols = [c for c in display_cols if c in final_df.columns]
             
             st.dataframe(
-                final_df[display_cols],
+                final_df[valid_display_cols],
                 use_container_width=True,
                 column_config={
                     "Correlation": st.column_config.NumberColumn(format="%.2f"),
                     "Relative_Z_Score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
-                    "PE_Ratio": st.column_config.NumberColumn("P/E Ratio", format="%.1f"),
-                    "Return_63d": st.column_config.NumberColumn("3-Mo Return", format="%.1f%%"),
+                    "PE_Ratio": st.column_config.NumberColumn("P/E", format="%.1f"),
+                    "Return_63d": st.column_config.NumberColumn("3M Ret", format="%.1f%%"),
                     "Pairs_Score": st.column_config.ProgressColumn(
                         "Pairs Score",
-                        help="Highlights potential pairs trades. = Correlation * |Z-Score Divergence|.",
+                        help="Correlation * |Z-Score Divergence|. Higher suggests a Mean-Reversion pairs trade opportunity.",
                         format="%.2f",
                         min_value=0,
-                        max_value=max(final_df['Pairs_Score'].max(), 3),
+                        max_value=max(final_df['Pairs_Score'].dropna().max(), 3) if not final_df['Pairs_Score'].dropna().empty else 3
                     ),
                 }
             )
         else:
-            st.info(f"No significant peers found based on the selected criteria.")
+            st.info("No significant peers or opportunities found for this ticker.")
 
 # --- NEW FUNCTION: apply_regime_weights(...) ---
 ################################################################################
