@@ -3776,16 +3776,16 @@ def get_correlated_stocks(selected_ticker, returns_dict, results_df, correlation
 def calculate_covariance_matrix(tickers, returns_dict, window=90):
     """
     Sophisticated Covariance Estimation:
-    1. Oracle Approximating Shrinkage (OAS)
-    2. Spectral Denoising (Eigenvalue clipping)
-    3. Tikhonov Regularization
+    - Lookback: 90 days (3 months)
+    - Scale: 252 days (Annualized)
     """
     n = len(tickers)
     if n == 0 or not returns_dict:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Align and Filter Data
+    # 1. Align and Filter Data (using the 90-day window)
     simple_rets = {t: np.expm1(returns_dict[t]) for t in tickers if t in returns_dict}
+    # .tail(window) correctly grabs only the last 3 months
     returns_df = pd.DataFrame(simple_rets).tail(window).dropna(axis=1, how='all').fillna(0)
     
     valid_tickers = returns_df.columns.tolist()
@@ -3793,25 +3793,27 @@ def calculate_covariance_matrix(tickers, returns_dict, window=90):
         identity = pd.DataFrame(np.eye(n), index=tickers, columns=tickers)
         return identity, identity
 
-    # OAS Shrinkage
+    # 2. OAS Shrinkage
     try:
         model = OAS().fit(returns_df)
-        cov_matrix = model.covariance_ * 90
+        # CRITICAL: Multiply by 252 to keep units in 'Annual Volatility'
+        cov_matrix = model.covariance_ * 252 
     except:
-        cov_matrix = returns_df.cov().values * 90
+        # Fallback
+        cov_matrix = returns_df.cov().values * 252
         cov_matrix = (1 - 0.1) * cov_matrix + 0.1 * np.diag(np.diag(cov_matrix))
 
-    # Spectral Denoising (The MALV Fix)
+    # 3. Spectral Denoising (The MALV Fix)
+    # This is extra important for a short 90-day window where noise is higher
     evals, evecs = eigh(cov_matrix)
     q = len(returns_df) / len(valid_tickers) 
     sigma_sq = np.mean(evals) 
     mp_threshold = sigma_sq * (1 + (1/q) + 2*np.sqrt(1/q))
     
-    # Clip eigenvalues to ensure precision matrix stability
     evals_denoised = np.maximum(evals, mp_threshold * 0.1) 
     cov_denoised = evecs @ np.diag(evals_denoised) @ evecs.T
     
-    # Final cleanup
+    # 4. Final cleanup
     cov_final = pd.DataFrame(np.eye(n) * np.mean(evals_denoised), index=tickers, columns=tickers)
     cov_final.loc[valid_tickers, valid_tickers] = cov_denoised
     
