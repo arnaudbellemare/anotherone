@@ -2687,16 +2687,9 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
 def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
     """
     Bleeding Edge Factor Weighting Engine:
-    1. Multi-Horizon IC Extraction
-    2. Eigen-Centrality Redundancy Pruning (Advanced Orthogonalization)
-    3. Empirical Bayes Shrinkage (Dynamic Noise Reduction)
-    4. Shannon Entropy Weighting
+    Eigen-Centrality Redundancy Pruning + Empirical Bayes Shrinkage.
     """
-    time_horizons = {
-        "1W": "Return_5d", "1M": "Return_21d",
-        "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d"
-    }
-    
+    time_horizons = {"1W": "Return_5d", "1M": "Return_21d", "3M": "Return_63d", "6M": "Return_126d", "12M": "Return_252d"}
     valid_chars = [c for c in results_df.columns if pd.api.types.is_numeric_dtype(results_df[c]) 
                    and 'Return' not in c and c not in ['Ticker', 'Name', 'Score', 'Sector']]
     
@@ -2704,79 +2697,42 @@ def run_factor_stability_analysis(results_df, all_metrics, reverse_metric_map):
     for label, target in time_horizons.items():
         if target in results_df.columns:
             ics = calculate_pure_returns(results_df, valid_chars, target=target)
-            if not ics.empty:
-                horizon_ics[label] = ics
+            if not ics.empty: horizon_ics[label] = ics
 
-    if not horizon_ics:
-        return {m: 0.0 for m in all_metrics}, pd.DataFrame(), {}
+    if not horizon_ics: return {m: 0.0 for m in all_metrics}, pd.DataFrame(), {}
 
-    # 3. Aggregate Stability Metrics
     ic_panel = pd.concat(horizon_ics.values(), axis=1, keys=horizon_ics.keys())
-    
     agg_df = pd.DataFrame(index=ic_panel.index)
     agg_df['avg_ic'] = ic_panel.mean(axis=1)
     agg_df['std_ic'] = ic_panel.std(axis=1)
-    
-    # Information Ratio of the Signal
     agg_df['ic_ir'] = agg_df['avg_ic'] / agg_df['std_ic'].replace(0, np.nan)
-    
-    # Sign Consistency (Sign Persistence)
     agg_df['consistency'] = ic_panel.apply(lambda x: (np.sign(x) == np.sign(agg_df.loc[x.name, 'avg_ic'])).mean(), axis=1)
 
-    # 4. --- MOST SOPHISTICATED: Eigen-Centrality Redundancy ---
-    # Instead of just summing correlations, we find the "Leading Eigenvector" 
-    # of the correlation matrix to identify which factors belong to the same 'crowded' cluster.
+    # Redundancy Pruning via Eigen-Centrality
     factor_data = results_df[valid_chars].fillna(results_df[valid_chars].median())
     try:
-        from sklearn.covariance import OAS
-        # Use OAS for the factor-to-factor correlation (more robust than Ledoit-Wolf for N assets)
         f_cov = OAS().fit(factor_data).covariance_
         f_vols = np.sqrt(np.diag(f_cov))
         f_corr = f_cov / np.outer(f_vols, f_vols)
-        
-        # Calculate the 'Absorption Capacity' (Eigen-centrality)
-        # Factors that explain too much of the total variance are 'redundant'
-        evals, _ = np.linalg.eigh(f_corr)
-        # Factors are penalized if they are part of a massive, highly-correlated cluster
         crowding_load = np.abs(f_corr).sum(axis=1)
         agg_df['redundancy_multiplier'] = 1 / np.log1p(crowding_load)
     except:
         agg_df['redundancy_multiplier'] = 1.0
 
-    # 5. --- MOST SOPHISTICATED: Empirical Bayes Shrinkage ---
-    # Instead of a fixed 0.5, we calculate shrinkage intensity based on IC volatility.
-    # If the standard deviation of the IC is high, we shrink more toward the prior.
+    # Empirical Bayes Shrinkage
     raw_signal = agg_df['ic_ir'].abs() * agg_df['consistency'] * agg_df['redundancy_multiplier']
-    
-    # Calculate Dynamic Shrinkage (Stein's Paradox logic)
-    # Intensity = Variance of Noise / (Variance of Signal + Variance of Noise)
-    signal_variance = agg_df['avg_ic'].var()
-    noise_variance = agg_df['std_ic'].mean()**2
-    
-    # Shrinkage factor 'v' (0 = no shrinkage, 1 = total shrinkage to mean)
-    shrinkage_v = noise_variance / (signal_variance + noise_variance) if (signal_variance + noise_variance) > 0 else 0.5
-    shrinkage_v = np.clip(shrinkage_v, 0.1, 0.9) # Keep within sane bounds
-    
-    prior_score = raw_signal.median()
-    agg_df['Final_Score'] = (shrinkage_v * prior_score) + ((1 - shrinkage_v) * raw_signal)
+    sig_var, noise_var = agg_df['avg_ic'].var(), agg_df['std_ic'].mean()**2
+    shrinkage_v = np.clip(noise_var / (sig_var + noise_var) if (sig_var + noise_var) > 0 else 0.5, 0.1, 0.9)
+    agg_df['Final_Score'] = (shrinkage_v * raw_signal.median()) + ((1 - shrinkage_v) * raw_signal)
 
-    # 6. Final Weight Normalization
     total_score = agg_df['Final_Score'].sum()
-    if total_score > 0:
-        agg_df['Final_Weight'] = (agg_df['Final_Score'] / total_score) * 100
-    else:
-        agg_df['Final_Weight'] = 0.0
+    agg_df['Final_Weight'] = (agg_df['Final_Score'] / total_score * 100) if total_score > 0 else 0.0
 
-    # Map back to Long Names
     final_weights_dict = {metric: 0.0 for metric in all_metrics}
     for short_name, row in agg_df.iterrows():
         long_name = METRIC_NAME_MAP.get(short_name, short_name)
-        if long_name in all_metrics:
-            final_weights_dict[long_name] = row['Final_Weight']
+        if long_name in all_metrics: final_weights_dict[long_name] = row['Final_Weight']
             
-    # For UI display consistency
-    agg_df['avg_sharpe_coeff'] = agg_df['ic_ir'] 
-    
     return final_weights_dict, agg_df, horizon_ics
 
 # The user's provided `robust_vol_calc` is more sophisticated and could be swapped in.
