@@ -19,13 +19,11 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.linear_model import LinearRegression, Ridge
 from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed, retry_if_exception_type
 import random
-from pandas_datareader import data as pdr
 import plotly.graph_objects as go
 from statsmodels.tsa.api import Holt
 from sklearn.preprocessing import RobustScaler
 import statsmodels.tsa.stattools as smt
 import plotly.express as px
-import pandas_datareader.data as web
 from hmmlearn.hmm import GaussianHMM
 from sklearn.covariance import OAS
 from scipy.linalg import eigh
