@@ -32,6 +32,9 @@ import statsmodels.tsa.api as sm
 import arch
 from sklearn.metrics import mean_absolute_error
 from plotly.subplots import make_subplots
+from scipy.stats import linregress
+import numpy as np
+import pandas as pd
 # --- Basic Configuration ---
 logging.basicConfig(filename='stock_analysis.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 st.set_page_config(page_title="Quantitative Portfolio Analysis", layout="wide")
@@ -173,36 +176,98 @@ def get_value(df, possible_keys, col_index=0):
     return np.nan
 def fit_msar_and_plot(df, title):
     """
-    Fits a 2-state Markov-Switching Autoregressive model and creates an interactive plot.
-    This model allows both the mean and variance to switch between regimes.
+    Fits a 2-state Markov-Switching model to the turbulence series
+    and creates an interactive plot of the high-volatility regime probability.
     """
-    if df.empty or df['Turbulence'].isnull().all() or len(df) < 20:
+
+    # --- 1. Basic validation ---
+    if df.empty or df['Turbulence'].isnull().all() or len(df) < 50:
         st.warning(f"Not enough data to fit MSAR for {title}.")
         return None, None
 
-    # We use the returns of the turbulence series for the MSAR model
-    y = df['Turbulence'].pct_change().dropna()
-    
-    # Define the MSAR model: 2 regimes, switching mean (trend='c'), and switching variance
+    # Ensure Date exists and is sorted
+    if 'Date' in df.columns:
+        df = df.sort_values('Date')
+    else:
+        df = df.sort_index()
+
+    # --- 2. Use level (not pct change), standardised ---
+    # Many regime papers work on the level or a transformed level of the index.
+    y = df['Turbulence'].astype(float).dropna()
+    if len(y) < 50:
+        st.warning(f"Not enough non-null turbulence data for {title}.")
+        return None, None
+
+    # Standardise to avoid scale issues across different assets/indices
+    y_mean = y.mean()
+    y_std = y.std()
+    if y_std == 0 or np.isnan(y_std):
+        st.warning(f"Turbulence series has zero or undefined variance for {title}.")
+        return None, None
+
+    y_stdized = (y - y_mean) / y_std
+
+    # --- 3. Define and fit Markov-Switching model ---
+    # 2 regimes, constant mean per regime, switching variance
     model = sm.tsa.MarkovRegression(
-        y, k_regimes=2, trend='c', switching_variance=True
+        y_stdized,
+        k_regimes=2,
+        trend='c',
+        switching_variance=True
     )
-    
+
     try:
-        # Fitting with search_reps helps find a better (global) optimum
-        res = model.fit(search_reps=10)
+        # Multiple random restarts to avoid bad local optima
+        res = model.fit(search_reps=10, disp=False)
     except Exception as e:
         st.error(f"MSAR model fitting failed for {title}: {e}")
         return None, None
 
-    # Get smoothed probabilities for the high-volatility regime
-    high_vol_regime = np.argmax(res.params[-2:]) # The last two params are the variances (sigma2)
-    df['MSAR_Event'] = res.smoothed_marginal_probabilities[high_vol_regime]
+    # --- 4. Identify high-volatility regime robustly ---
+    # statsmodels stores regime-specific variances in res.params in a structured way,
+    # but to avoid brittle direct indexing, we reconstruct regime variances
+    # from the smoothed residuals per regime.
 
-    # Create Plotly figure
+    # Smoothed probabilities: T x k array
+    smoothed_probs = res.smoothed_marginal_probabilities
+
+    # Approximate per-regime variance by weighting squared residuals
+    # This is more robust than "last 2 params" assumptions.
+    resid = res.resid
+    regime_vars = []
+    for k in range(model.k_regimes):
+        weights = smoothed_probs[k]
+        # Normalise weights to sum to 1 to avoid scale issues
+        w_sum = weights.sum()
+        if w_sum == 0:
+            regime_vars.append(np.nan)
+        else:
+            regime_vars.append(np.sum(weights * (resid ** 2)) / w_sum)
+
+    # Choose regime with highest variance as "high vol"
+    high_vol_regime = int(np.nanargmax(regime_vars))
+
+    # --- 5. Attach high-vol regime probability to df ---
+    # Align smoothed probabilities with y index
+    prob_series = pd.Series(
+        smoothed_probs[high_vol_regime],
+        index=y_stdized.index,
+        name='MSAR_Event'
+    )
+
+    # Ensure df has Date aligned with y index; if not, join on index
+    if 'Date' in df.columns:
+        df = df.set_index(y_stdized.index)
+    df['MSAR_Event'] = prob_series
+
+    # --- 6. Plot with Plotly ---
     fig = go.Figure()
+    # Use Date if available, else index
+    x_vals = df['Date'] if 'Date' in df.columns else df.index
+
     fig.add_trace(go.Bar(
-        x=df['Date'], y=df['MSAR_Event'] * 100,
+        x=x_vals,
+        y=df['MSAR_Event'] * 100,
         name='Probability of High-Vol Regime',
         marker_color='rgba(26, 118, 255, 0.6)'
     ))
@@ -213,75 +278,193 @@ def fit_msar_and_plot(df, title):
         height=300,
         margin=dict(l=20, r=20, t=40, b=20)
     )
-    fig.add_hline(y=50, line_dash="dash", line_color="gray", annotation_text="50% Threshold")
+    fig.add_hline(
+        y=50,
+        line_dash="dash",
+        line_color="gray",
+        annotation_text="50% Threshold"
+    )
 
-    # Create a summary of the regimes
-    summary = pd.DataFrame({
-        'Mean (const)': res.params[0:2],
-        'Volatility (std dev)': np.sqrt(res.params[-2:])
-    }, index=[f'Regime {i}' for i in range(2)])
-    
-    return fig, summary    
-def calculate_regime_aware_betas(stock_returns, market_returns, lookback=252):
+    # --- 7. Summarise regimes (mean and volatility) ---
+    # Regime-specific means are accessible directly through res.params for the constants.
+    # To avoid fragile indexing, we reconstruct them using predicted means per regime.
+
+    regime_means = []
+    for k in range(model.k_regimes):
+        # Approximate regime mean by weighting y with regime probabilities
+        weights = smoothed_probs[k]
+        w_sum = weights.sum()
+        if w_sum == 0:
+            regime_means.append(np.nan)
+        else:
+            regime_means.append(np.sum(weights * y_stdized) / w_sum)
+
+    summary = pd.DataFrame(
+        {
+            'Mean (standardised)': regime_means,
+            'Volatility (std dev, standardised)': np.sqrt(regime_vars),
+        },
+        index=[f'Regime {i}' for i in range(model.k_regimes)]
+    )
+
+    return fig, summary
+
+
+def compute_z_scored_factors(results_df, default_weights):
     """
-    Calculates separate betas for up-market and down-market days.
-    This version is corrected to always return a dictionary, fixing potential errors.
+    Returns a DataFrame of cross-sectional z-scores for all factors
+    that appear in default_weights and exist in results_df.
     """
-    # Align and slice data
+
+    # Keep only factors that actually exist in results_df
+    common_factors = [f for f in default_weights.keys() if f in results_df.columns]
+
+    if not common_factors:
+        # Nothing to score
+        return pd.DataFrame(index=results_df.index)
+
+    # Slice the factor columns
+    factor_df = results_df[common_factors].copy()
+
+    # Cross-sectional z-score per factor (column-wise)
+    z_factors = (factor_df - factor_df.mean()) / factor_df.std(ddof=0)
+
+    # If a factor has zero std (all same value), z-score becomes NaN; set to 0
+    z_factors = z_factors.fillna(0.0)
+
+    return z_factors
+
+
+def apply_weighted_score(results_df, default_weights):
+    """
+    Adds a 'Score' column to results_df using z-scored factors
+    and the given default_weights.
+    """
+
+    z_factors = compute_z_scored_factors(results_df, default_weights)
+
+    if z_factors.empty:
+        results_df['Score'] = np.nan
+        return results_df
+
+    # Align weights to the z_factors columns
+    weights = pd.Series(
+        {f: w for f, w in default_weights.items() if f in z_factors.columns},
+        index=z_factors.columns
+    )
+
+    # Weighted sum across factors: Score_i = Σ_j (w_j * z_ij)
+    results_df['Score'] = z_factors.mul(weights, axis=1).sum(axis=1)
+
+    return results_df
+def calculate_regime_aware_betas(stock_returns, market_returns, lookback=252,
+                                 min_total_obs=60, min_regime_obs=20):
+    """
+    Calculates separate betas for up-market and down-market days, plus a conservative beta.
+
+    - stock_returns: pd.Series of stock returns (aligned by date)
+    - market_returns: pd.Series of market returns (aligned by date)
+    - lookback: number of most recent observations to use
+    - min_total_obs: minimum total observations required to attempt regime betas
+    - min_regime_obs: minimum observations per regime (up/down) to trust separate betas
+
+    Returns a dict:
+        {
+            'down_beta': float or np.nan,
+            'up_beta': float or np.nan,
+            'conservative_beta': float or np.nan
+        }
+    """
+
+    # --- 1. Align and slice data ---
     df = pd.concat([stock_returns, market_returns], axis=1).dropna().tail(lookback)
+    if df.empty or df.shape[0] < 5:
+        # Not enough data to say anything meaningful
+        return {'down_beta': np.nan, 'up_beta': np.nan, 'conservative_beta': np.nan}
+
     df.columns = ['stock', 'market']
 
-    # Define regimes based on market returns
+    # --- 2. Split into regimes ---
     down_market_days = df[df['market'] < 0]
-    up_market_days = df[df['market'] >= 0]
+    up_market_days   = df[df['market'] >= 0]
 
-    # --- THIS IS THE CORRECTED LOGIC ---
-    # Check if there's enough data for a stable estimate in both regimes
-    if len(df) < 30: # Added total data length check
+    n_total = len(df)
+    n_down  = len(down_market_days)
+    n_up    = len(up_market_days)
+
+    # --- 3. Basic sanity checks ---
+    # If overall sample is tiny, just bail out
+    if n_total < min_total_obs:
         return {'down_beta': np.nan, 'up_beta': np.nan, 'conservative_beta': np.nan}
-        
-    if len(down_market_days) < 10 or len(up_market_days) < 10: # Lowered threshold for robustness
-        # If not, fall back to a simple, single beta for all cases.
-        # This ensures the function *always* returns the expected dictionary format.
+
+    # Helper: robust single beta on full sample
+    def overall_beta(data):
+        # Avoid regression if market series is nearly constant
+        if data['market'].std() < 1e-6 or np.isnan(data['market'].std()):
+            return 0.0
+        slope = linregress(data['market'], data['stock']).slope
+        return slope
+
+    # Helper: robust beta for a given regime
+    def regime_beta(data):
+        if len(data) < 3:
+            return np.nan
+        if data['market'].std() < 1e-6 or np.isnan(data['market'].std()):
+            return np.nan
+        slope = linregress(data['market'], data['stock']).slope
+        return slope
+
+    # --- 4. If one regime is too small, fall back to overall beta ---
+    if (n_down < min_regime_obs) or (n_up < min_regime_obs):
         try:
-            # Ensure market returns are not all zero or constant
-            if df['market'].std() < 1e-6: # Added variance check
-                beta = 0.0 # No market movement to regress against
-            else:
-                beta = linregress(df['market'], df['stock']).slope
-            # Return the single beta for all keys
-            return {'down_beta': beta, 'up_beta': beta, 'conservative_beta': beta}
-        except ValueError:
-            # Handle rare cases where linregress fails on small samples
-            return {'down_beta': 1.0, 'up_beta': 1.0, 'conservative_beta': 1.0}
+            beta = overall_beta(df)
+        except Exception:
+            beta = np.nan
 
+        return {
+            'down_beta': beta,
+            'up_beta': beta,
+            # Conservative choice: treat overall beta as the risk measure
+            'conservative_beta': beta
+        }
 
-    # If there IS enough data, calculate beta for each regime
+    # --- 5. Compute separate betas for up and down regimes ---
     try:
-        # Check for constant market returns in sub-samples
-        if down_market_days['market'].std() < 1e-6: # Added variance check for down market
-            down_beta = 0.0
-        else:
-            down_beta = linregress(down_market_days['market'], down_market_days['stock']).slope
-            
-        if up_market_days['market'].std() < 1e-6: # Added variance check for up market
-            up_beta = 0.0
-        else:
-            up_beta = linregress(up_market_days['market'], up_market_days['stock']).slope
-        
-        # The conservative beta is the one with the larger magnitude, representing the bigger risk.
-        conservative_beta = down_beta if abs(down_beta) > abs(up_beta) else up_beta
-        
-        return {'down_beta': down_beta, 'up_beta': up_beta, 'conservative_beta': conservative_beta}
+        down_beta = regime_beta(down_market_days)
+    except Exception:
+        down_beta = np.nan
 
-    except Exception as e:
-        logging.error(f"Error in regime beta calculation, falling back. Error: {e}")
-        # Fallback in case of an unexpected error during regression
-        if df['market'].std() < 1e-6: # Added variance check for fallback
-            beta = 0.0
-        else:
-            beta = linregress(df['market'], df['stock']).slope
-        return {'down_beta': beta, 'up_beta': beta, 'conservative_beta': beta}
+    try:
+        up_beta = regime_beta(up_market_days)
+    except Exception:
+        up_beta = np.nan
+
+    # --- 6. If both regime betas failed, fall back to overall ---
+    if np.isnan(down_beta) and np.isnan(up_beta):
+        try:
+            beta = overall_beta(df)
+        except Exception:
+            beta = np.nan
+        return {
+            'down_beta': beta,
+            'up_beta': beta,
+            'conservative_beta': beta
+        }
+
+    # --- 7. Define conservative beta ---
+    # One sensible choice: focus on downside risk – conservative_beta = max(down_beta, up_beta)
+    # You can change this rule depending on your risk philosophy.
+    betas = [b for b in [down_beta, up_beta] if not np.isnan(b)]
+    if len(betas) == 0:
+        conservative_beta = np.nan
+    else:
+        conservative_beta = max(betas)
+
+    return {
+        'down_beta': down_beta,
+        'up_beta': up_beta,
+        'conservative_beta': conservative_beta
+    }
 def display_macro_regime_analysis():
     """
     Orchestrates and displays the entire macro volatility regime analysis.
@@ -3928,17 +4111,19 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-    # --- 2. Data Fetching and Initial Processing ---
-    with st.spinner("Fetching histories and processing universe..."):
-        etf_histories = fetch_all_etf_histories(etf_list)
-        macro_data = fetch_macro_data()
-        results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
+        with st.spinner("Fetching histories and processing universe..."):
+            etf_histories = fetch_all_etf_histories(etf_list)
+            macro_data = fetch_macro_data()
+            results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
 
-    if results_df.empty:
-        st.error("Fatal Error: No tickers could be processed."); st.stop()
+        if results_df.empty:
+            st.error("Fatal Error: No tickers could be processed."); st.stop()
 
-    # --- 3. Data Cleaning & Advanced Signals ---
-    with st.spinner("Applying Winsorization and Generating Advanced Signals..."):
+# NEW: apply factor weights on z-scored factors
+        results_df = apply_weighted_score(results_df, default_weights)
+
+# --- 3. Data Cleaning & Advanced Signals ---
+        with st.spinner("Applying Winsorization and Generating Advanced Signals..."):
         # Winsorize log returns for signal stability
         winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
         
