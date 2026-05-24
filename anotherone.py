@@ -2782,17 +2782,16 @@ def calculate_cs_mean_reversion(results_df, normalized_prices, horizon=126, ewma
     normalized_prices_aligned = normalized_prices[valid_tickers_in_prices]
 
     # Get the sector for each ticker, ensuring alignment
-    sector_map = results_df.set_index('Ticker')['Sector'].reindex(valid_tickers_in_prices)
-    
-    # Calculate the price change over the horizon for each stock
-    # Ensure diff operation considers sufficient previous data
-    instrument_change = normalized_prices_aligned.diff(horizon)
-    
-    # Calculate the average price change for each sector (asset class)
-    # Use .groupby then .transform to map back to original DataFrame shape
-    asset_class_change = instrument_change.groupby(sector_map, axis=1).transform('mean')
+    sector_map = results_df.drop_duplicates('Ticker').set_index('Ticker')['Sector'].reindex(valid_tickers_in_prices)
 
-    # Calculate the outperformance (Disequilibrium)
+    instrument_change = normalized_prices_aligned.diff(horizon)
+
+    valid_cols = sector_map[sector_map.notna()].index.tolist()
+    instrument_change = instrument_change[valid_cols]
+
+    sector_labels = sector_map.loc[valid_cols].values
+    asset_class_change = instrument_change.T.groupby(sector_labels).transform('mean').T
+
     outperformance = instrument_change - asset_class_change
     
     # The final forecast is the negative EWMA of this outperformance
