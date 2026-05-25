@@ -3976,8 +3976,14 @@ def safe_fetch_history(ticker_symbol):
     return df
 
 def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histories):
+    """
+    Orchestrator function to display the entire individual stock dashboard.
+    Robustly handles Peer Analysis and Sorting to prevent KeyErrors and
+    handles upstream data errors gracefully.
+    """
     st.header(f"🔬 Detailed Dashboard for {ticker_symbol}")
-    
+
+    # 1. Fetch daily history safely (handles rate limits / errors)
     try:
         daily_history = safe_fetch_history(ticker_symbol)
     except Exception as e:
@@ -3987,30 +3993,31 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
     if daily_history.empty:
         st.warning("Could not fetch detailed daily history for this ticker.")
         return
-        
-        # Pull processed fundamental/quant data from the results universe
-        stock_data_row = results_df[results_df['Ticker'] == ticker_symbol]
+
+    # 2. Pull processed fundamental/quant data from the results universe
+    try:
+        stock_data_row = results_df[results_df["Ticker"] == ticker_symbol]
         if stock_data_row.empty:
             st.error(f"Stock data for {ticker_symbol} not found in processed results.")
             return
         stock_data = stock_data_row.iloc[0].to_dict()
-        
     except Exception as e:
-        st.error(f"Error fetching data for dashboard: {e}")
+        st.error(f"Error accessing processed stock data: {e}")
         return
 
-    # 1. Timing and Quality Checklist
-    if 'display_signal_sigma_checklist' in globals():
+    # 3. Timing and Quality Checklist
+    if "display_signal_sigma_checklist" in globals():
         display_signal_sigma_checklist(stock_data, daily_history)
         st.divider()
 
-    # 2. Layout: Left Column (Technicals) | Right Column (Peer Analysis)
+    # 4. Layout: Left Column (Technicals) | Right Column (Peer Analysis)
     col1, col2 = st.columns([1.2, 0.8])
-    
+
+    # ----- LEFT: Technicals -----
     with col1:
         # Gauges and Technical Indicators
         display_ma_deviation(daily_history)
-        
+
         c1_tech, c2_tech, c3_tech = st.columns(3)
         with c1_tech:
             std_dev_reg, trend_str = get_regression_metrics(daily_history)
@@ -4018,10 +4025,20 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
         with c2_tech:
             st.metric("Medium-Term Trend", trend_str)
         with c3_tech:
-            hurst_val = stock_data.get('Hurst_Exponent')
+            hurst_val = stock_data.get("Hurst_Exponent")
             if pd.notna(hurst_val):
-                hurst_label = "Trending" if hurst_val > 0.55 else "Mean-Reverting" if hurst_val < 0.45 else "Random"
-                st.metric("Hurst Exponent", f"{hurst_val:.3f}", delta=hurst_label, delta_color="off")
+                if hurst_val > 0.55:
+                    hurst_label = "Trending"
+                elif hurst_val < 0.45:
+                    hurst_label = "Mean-Reverting"
+                else:
+                    hurst_label = "Random"
+                st.metric(
+                    "Hurst Exponent",
+                    f"{hurst_val:.3f}",
+                    delta=hurst_label,
+                    delta_color="off",
+                )
             else:
                 st.metric("Hurst Exponent", "N/A")
 
@@ -4034,58 +4051,87 @@ def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histori
             c3_atr.metric("ATR High", f"${risk_high:,.2f}")
         else:
             st.info("Insufficient data for ATR risk range.")
-        
+
         display_momentum_bar(ticker_symbol, daily_history)
 
+    # ----- RIGHT: Peer Analysis -----
     with col2:
         st.subheader("Actionable Peer Analysis (90d)")
-        
+
         sort_by = st.radio(
             "Sort Peers By:",
-            ('Pairs Score (Best Opportunities)', 'Correlation (Truest Peers)'),
+            ("Pairs Score (Best Opportunities)", "Correlation (Truest Peers)"),
             horizontal=True,
-            label_visibility="collapsed"
+            label_visibility="collapsed",
         )
-        
-        # Logic to determine which columns we are targeting
-        if sort_by == 'Pairs Score (Best Opportunities)':
+
+        # Determine peer search mode
+        if sort_by == "Pairs Score (Best Opportunities)":
             # Search whole market (threshold=None) for divergence opportunities
-            correlated_stocks_df = get_correlated_stocks(ticker_symbol, returns_dict, results_df, correlation_threshold=None)
-            sort_key = 'Pairs_Score'
+            correlated_stocks_df = get_correlated_stocks(
+                ticker_symbol,
+                returns_dict,
+                results_df,
+                correlation_threshold=None,
+            )
+            sort_key = "Pairs_Score"
         else:
             # Search for high-correlation (threshold=0.6) peers
-            correlated_stocks_df = get_correlated_stocks(ticker_symbol, returns_dict, results_df, correlation_threshold=0.6)
-            sort_key = 'Correlation'
+            correlated_stocks_df = get_correlated_stocks(
+                ticker_symbol,
+                returns_dict,
+                results_df,
+                correlation_threshold=0.6,
+            )
+            sort_key = "Correlation"
 
-        # --- SOPHISTICATED SAFETY CHECK: Prevent KeyError 'Pairs_Score' ---
+        # --- SAFETY CHECK: Prevent KeyError 'Pairs_Score' ---
         if not correlated_stocks_df.empty and sort_key in correlated_stocks_df.columns:
-            
-            # Ensure we only try to sort if there are non-NaN values to look at
+            # Only sort if there are non-NaN values
             if correlated_stocks_df[sort_key].notna().any():
-                final_df = correlated_stocks_df.sort_values(sort_key, ascending=False).head(15)
+                final_df = correlated_stocks_df.sort_values(
+                    sort_key, ascending=False
+                ).head(15)
             else:
                 final_df = correlated_stocks_df.head(15)
 
-            display_cols = ['Correlation', 'Relative_Z_Score', 'PE_Ratio', 'Return_63d', 'Pairs_Score']
+            display_cols = [
+                "Correlation",
+                "Relative_Z_Score",
+                "PE_Ratio",
+                "Return_63d",
+                "Pairs_Score",
+            ]
             # Filter display_cols to only those that exist in final_df
             valid_display_cols = [c for c in display_cols if c in final_df.columns]
-            
+
             st.dataframe(
                 final_df[valid_display_cols],
                 use_container_width=True,
                 column_config={
                     "Correlation": st.column_config.NumberColumn(format="%.2f"),
-                    "Relative_Z_Score": st.column_config.NumberColumn("Z-Score", format="%.2f"),
+                    "Relative_Z_Score": st.column_config.NumberColumn(
+                        "Z-Score", format="%.2f"
+                    ),
                     "PE_Ratio": st.column_config.NumberColumn("P/E", format="%.1f"),
-                    "Return_63d": st.column_config.NumberColumn("3M Ret", format="%.1f%%"),
+                    "Return_63d": st.column_config.NumberColumn(
+                        "3M Ret", format="%.1f%%"
+                    ),
                     "Pairs_Score": st.column_config.ProgressColumn(
                         "Pairs Score",
-                        help="Correlation * |Z-Score Divergence|. Higher suggests a Mean-Reversion pairs trade opportunity.",
+                        help=(
+                            "Correlation * |Z-Score Divergence|. "
+                            "Higher suggests a mean-reversion pairs trade opportunity."
+                        ),
                         format="%.2f",
                         min_value=0,
-                        max_value=max(final_df['Pairs_Score'].dropna().max(), 3) if not final_df['Pairs_Score'].dropna().empty else 3
+                        max_value=(
+                            max(final_df["Pairs_Score"].dropna().max(), 3)
+                            if not final_df["Pairs_Score"].dropna().empty
+                            else 3
+                        ),
                     ),
-                }
+                },
             )
         else:
             st.info("No significant peers or opportunities found for this ticker.")
