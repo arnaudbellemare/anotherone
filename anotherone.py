@@ -3963,21 +3963,30 @@ def calculate_covariance_matrix(tickers, returns_dict, window=90):
     corr_final = pd.DataFrame(corr_matrix, index=tickers, columns=tickers)
 
     return corr_final, cov_final
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=30))
+def safe_fetch_history(ticker_symbol):
+    ticker_obj = yf.Ticker(ticker_symbol)
+    df = ticker_obj.history(
+        period="3y",
+        auto_adjust=True,
+        interval="1d"
+    ).tz_localize(None)
+    return df
+
 def display_stock_dashboard(ticker_symbol, results_df, returns_dict, etf_histories):
-    """
-    Orchestrator function to display the entire individual stock dashboard.
-    Robustly handles Peer Analysis and Sorting to prevent KeyErrors.
-    """
     st.header(f"🔬 Detailed Dashboard for {ticker_symbol}")
     
     try:
-        # Fetch high-resolution history for technicals
-        ticker_obj = yf.Ticker(ticker_symbol)
-        daily_history = ticker_obj.history(period="3y", auto_adjust=True, interval="1d").tz_localize(None)
-        
-        if daily_history.empty:
-            st.warning("Could not fetch detailed daily history for this ticker.")
-            return
+        daily_history = safe_fetch_history(ticker_symbol)
+    except Exception as e:
+        st.error(f"Error fetching data for dashboard: {e}")
+        return
+
+    if daily_history.empty:
+        st.warning("Could not fetch detailed daily history for this ticker.")
+        return
         
         # Pull processed fundamental/quant data from the results universe
         stock_data_row = results_df[results_df['Ticker'] == ticker_symbol]
