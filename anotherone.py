@@ -9,6 +9,7 @@ from tqdm import tqdm
 import time
 import logging
 from scipy.stats import linregress, chi2, norm
+from scipy import stats
 from scipy.linalg import solve_toeplitz
 import cvxpy as cp
 from arch import arch_model
@@ -28,6 +29,7 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.covariance import OAS
 from scipy.linalg import eigh
 import statsmodels.tsa.api as sm
+import pandas_datareader as pdr
 # Add these to your main script's import section
 import arch
 from sklearn.metrics import mean_absolute_error
@@ -38,6 +40,28 @@ import pandas as pd
 # --- Basic Configuration ---
 logging.basicConfig(filename='stock_analysis.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 st.set_page_config(page_title="Quantitative Portfolio Analysis", layout="wide")
+# --- Deterministic Configuration ---
+SEED = 42
+DETERMINISTIC_MODE = True
+ANALYSIS_END_DATE = pd.Timestamp("2024-12-31")
+
+def _set_deterministic_seed():
+    np.random.seed(SEED)
+    random.seed(SEED)
+
+_set_deterministic_seed()
+
+def _analysis_end_datetime():
+    """Return fixed analysis end as datetime for APIs expecting datetime."""
+    return ANALYSIS_END_DATE.to_pydatetime()
+
+def _analysis_end_str():
+    return ANALYSIS_END_DATE.strftime("%Y-%m-%d")
+
+def _analysis_year():
+    return ANALYSIS_END_DATE.year
+
+
 
 # --- Data Structures and Mappings ---
 sector_etf_map = {
@@ -143,7 +167,6 @@ METRIC_NAME_MAP = {
 }
 REVERSE_METRIC_NAME_MAP = {v: k for k, v in METRIC_NAME_MAP.items()}
 
-
 ################################################################################
 # SECTION 1: ALL FUNCTION DEFINITIONS
 ################################################################################
@@ -217,8 +240,8 @@ def fit_msar_and_plot(df, title):
     )
 
     try:
-        # Multiple random restarts to avoid bad local optima
-        res = model.fit(search_reps=10, disp=False)
+        # Deterministic EM from default starting values (search_reps=0)
+        res = model.fit(search_reps=0, disp=False)
     except Exception as e:
         st.error(f"MSAR model fitting failed for {title}: {e}")
         return None, None
@@ -309,7 +332,6 @@ def fit_msar_and_plot(df, title):
 
     return fig, summary
 
-
 def compute_z_scored_factors(results_df, default_weights):
     """
     Returns a DataFrame of cross-sectional z-scores for all factors
@@ -333,7 +355,6 @@ def compute_z_scored_factors(results_df, default_weights):
     z_factors = z_factors.fillna(0.0)
 
     return z_factors
-
 
 def apply_weighted_score(results_df, default_weights):
     """
@@ -465,6 +486,133 @@ def calculate_regime_aware_betas(stock_returns, market_returns, lookback=252,
         'up_beta': up_beta,
         'conservative_beta': conservative_beta
     }
+
+
+# --- Macro regime helpers (deterministic; MSAR uses search_reps=0) ---
+def calculate_returns(price_df):
+    """Daily percent returns from a yfinance OHLCV frame."""
+    if price_df is None or price_df.empty:
+        return pd.Series(dtype=float)
+    close = price_df['Close'] if 'Close' in price_df.columns else price_df.iloc[:, 0]
+    return close.pct_change(fill_method=None).dropna() * 100
+
+
+def fit_garch_model(returns_series):
+    try:
+        scaled = returns_series.dropna().astype(float) * 100
+        if len(scaled) < 30 or scaled.std() < 1e-8:
+            return None, "Insufficient return data for GARCH."
+        model = arch_model(scaled, vol='Garch', p=1, q=1)
+        res = model.fit(disp='off')
+        return res, "OK"
+    except Exception as e:
+        return None, str(e)
+
+
+def fit_hmm_gaussian(cond_vol_series, n_hidden_states):
+    try:
+        y = cond_vol_series.dropna().astype(float).values.reshape(-1, 1)
+        if len(y) < 30:
+            return (None, None, None, None, None, None), "Insufficient data for HMM."
+        model = GaussianHMM(
+            n_components=n_hidden_states,
+            covariance_type="full",
+            n_iter=1000,
+            random_state=SEED,
+        )
+        model.fit(y)
+        probs = model.predict_proba(y)
+        idx = cond_vol_series.dropna().index
+        hmm_post_probs_df = pd.DataFrame(probs, index=idx)
+        means = model.means_.flatten()
+        sigmas = np.sqrt(np.array([c[0][0] for c in model.covars_]))
+        states = probs.argmax(axis=1)
+        return (states, means, sigmas, None, hmm_post_probs_df, None), "OK"
+    except Exception as e:
+        return (None, None, None, None, None, None), str(e)
+
+
+def fit_msar_model(returns_series, k_reg=3, order_ar=1, trend_msar='n'):
+    try:
+        y = returns_series.dropna().astype(float)
+        if len(y) < 50 or y.std() < 1e-8:
+            return None, "Insufficient data for MSAR."
+        y_std = (y - y.mean()) / y.std()
+        trend = 'c' if trend_msar == 'c' else 'n'
+        model = sm.tsa.MarkovRegression(
+            y_std, k_regimes=k_reg, trend=trend, switching_variance=True
+        )
+        res = model.fit(search_reps=0, disp=False)
+        return res, "OK"
+    except Exception as e:
+        return None, str(e)
+
+
+def create_regime_table(hmm_states, hmm_means, hmm_sigmas, hmm_post_probs_df,
+                        msar_states, msar_post_probs_df, rt_sp500):
+    rows = []
+    if hmm_post_probs_df is not None and not hmm_post_probs_df.empty:
+        latest = hmm_post_probs_df.iloc[-1]
+        regime = int(latest.idxmax()) if hasattr(latest, 'idxmax') else int(latest.argmax())
+        rows.append({
+            'Model': 'HMM (GARCH vol)',
+            'Current Regime': regime,
+            'Regime Probability': float(latest.max()),
+        })
+    if msar_post_probs_df is not None and not msar_post_probs_df.empty:
+        latest = msar_post_probs_df.iloc[-1]
+        regime = int(latest.idxmax()) if hasattr(latest, 'idxmax') else int(latest.argmax())
+        rows.append({
+            'Model': 'MSAR (returns)',
+            'Current Regime': regime,
+            'Regime Probability': float(latest.max()),
+        })
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows)
+
+
+def plot_vol_regimes_prob(dates, series, probs_df, title, y_axis_label=""):
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dates, y=series, name=y_axis_label or "Series", line=dict(color='lightgray')))
+    for col in probs_df.columns:
+        fig.add_trace(go.Scatter(x=probs_df.index, y=probs_df[col] * 100, name=f'Regime {col}', stackgroup='one'))
+    fig.update_layout(title=title, yaxis_title='Probability (%)', template='plotly_dark', height=350)
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def return_dist_stats(returns_series):
+    st.dataframe(returns_series.describe().to_frame('Stats'))
+
+
+def test_dist(returns_series, test_type):
+    r = returns_series.dropna().astype(float)
+    if r.empty:
+        st.warning(f"No data for {test_type} test.")
+        return
+    if test_type == 'mean':
+        t_stat, p_val = stats.ttest_1samp(r, 0.0, nan_policy='omit')
+        st.write(f"Mean t-test: t={t_stat:.3f}, p={p_val:.4f}")
+    elif test_type == 'normal':
+        from scipy import stats as scipy_stats
+        k2, p = scipy_stats.normaltest(r)
+        st.write(f"D'Agostino K² normality: stat={k2:.3f}, p={p:.4f}")
+
+
+def display_theoretical_background():
+    st.header("Theoretical Background")
+    st.markdown(
+        """
+        This dashboard combines cross-sectional factor scoring, regime detection (HMM / MSAR),
+        turbulence (Mahalanobis) metrics, and portfolio construction with optional hedging.
+
+        **Deterministic mode:** `SEED`, `ANALYSIS_END_DATE`, and `DETERMINISTIC_MODE` at the top of
+        the script freeze randomness, data end dates, and concurrent result ordering so repeated
+        runs match when inputs are unchanged.
+        """
+    )
+
+
 def display_macro_regime_analysis():
     """
     Orchestrates and displays the entire macro volatility regime analysis.
@@ -475,7 +623,7 @@ def display_macro_regime_analysis():
 
     # --- Configuration ---
     data_start_date = "2007-01-01"
-    data_end_date = datetime.today().strftime('%Y-%m-%d')
+    data_end_date = _analysis_end_str()
     n_hidden_states = 3  # HMM states
     k_regimes = 3      # MSAR regimes
 
@@ -577,64 +725,6 @@ def nearest_psd_matrix(matrix):
         # Fallback to identity matrix on error
         logging.error(f"Error in PSD correction: {e}")
         return np.eye(len(matrix))
-
-# --------------------------------------------------------------------------------------
-# --- CORRECTED FUNCTION ---------------------------------------------------------------
-# --------------------------------------------------------------------------------------
-@st.cache_data
-def fetch_turbulence_data():
-    """
-    Fetches live data for economic growth, inflation, sectors, and currencies.
-    This version is corrected to be robust against yfinance download failures.
-    """
-    end_date = datetime.now()
-    start_date = "1990-01-01"
-    empty_df = pd.DataFrame()
-
-    # 1. Economic Data from FRED
-    try:
-        fred_tickers = {
-            'GNPC96': 'Economic Growth', # Real Gross National Product, Quarterly
-            'CPIAUCSL': 'Inflation'       # Consumer Price Index, Monthly
-        }
-        econ_df = web.DataReader(list(fred_tickers.keys()), 'fred', "1947-01-01", end_date)
-        econ_df = econ_df.rename(columns=fred_tickers)
-        econ_growth = econ_df[['Economic Growth']].dropna().pct_change() * 100
-        inflation = econ_df[['Inflation']].dropna().pct_change() * 100
-    except Exception as e:
-        logging.error(f"Failed to fetch FRED data: {e}")
-        # Return 4 empty dataframes to match the expected output signature
-        return empty_df, empty_df, empty_df, empty_df
-
-    # 2. S&P 500 Sector Data (Robust Download)
-    sector_tickers = list(sector_etf_map.values())
-    raw_sector_data = yf.download(sector_tickers, start=start_date, end=end_date, progress=False)
-    
-    # Check if download failed or returned malformed data before accessing columns
-    if raw_sector_data.empty or 'Adj Close' not in raw_sector_data.columns:
-        logging.error("yfinance download for sector tickers failed or returned invalid data.")
-        st.error("Failed to download sector ETF data. Turbulence analysis will be skipped.")
-        return empty_df, empty_df, empty_df, empty_df # Match output signature
-    sector_prices = raw_sector_data['Adj Close'].dropna()
-
-    # 3. G-10 Currency Data (Robust Download)
-    currency_tickers = ['EURUSD=X', 'JPY=X', 'GBPUSD=X', 'CHF=X', 'CAD=X', 'AUDUSD=X', 'NZDUSD=X', 'SEK=X', 'NOK=X']
-    raw_currency_data = yf.download(currency_tickers, start=start_date, end=end_date, progress=False)
-
-    # Check if download failed before accessing columns
-    if raw_currency_data.empty or 'Adj Close' not in raw_currency_data.columns:
-        logging.error("yfinance download for currency tickers failed or returned invalid data.")
-        st.error("Failed to download currency data. Turbulence analysis will be skipped.")
-        return empty_df, empty_df, empty_df, empty_df # Match output signature
-    currency_prices = raw_currency_data['Adj Close'].dropna()
-
-    return econ_growth.reset_index().rename(columns={'DATE':'Date'}), \
-           inflation.reset_index().rename(columns={'DATE':'Date'}), \
-           sector_prices.reset_index(), \
-           currency_prices.reset_index()
-# --------------------------------------------------------------------------------------
-# --- END OF CORRECTION ----------------------------------------------------------------
-# --------------------------------------------------------------------------------------
 
 def compute_turbulence(price_df, years=3, alpha=0.01):
     """
@@ -870,16 +960,14 @@ def calculate_robust_hedge_weights(
         logging.error("Robust hedging failed due to singular matrix. Returning zero weights.")
         return pd.Series(0.0, index=X.columns)
 
-
 @st.cache_data
-def fetch_macro_data(start_date="2018-01-01"):
+def fetch_macro_data(start_date="2018-01-01", end_date=None):
     """
     Fetches key macroeconomic time-series data from the FRED database.
     This version uses a default start date and calculates the end date automatically.
     """
     try:
-        # Calculate end_date inside the function
-        end_date = datetime.now()
+        end_date = _analysis_end_datetime() if end_date is None else pd.Timestamp(end_date).to_pydatetime()
         
         # Fetch 10-Year Treasury Yield (Interest Rates)
         ten_year_yield = pdr.DataReader('DGS10', 'fred', start_date, end_date) # Explicitly used pdr.DataReader
@@ -897,16 +985,16 @@ def fetch_macro_data(start_date="2018-01-01"):
     except Exception as e:
         logging.error(f"Failed to fetch macro data: {e}")
         # Return a dummy dataframe on failure to prevent crashes
-        date_range = pd.date_range(start=start_date, end=datetime.now())
+        date_range = pd.date_range(start=start_date, end=_analysis_end_datetime())
         return pd.DataFrame(0, index=date_range, columns=['Interest_Rate', 'Stress_Index'])
 
 @st.cache_data
-def fetch_turbulence_data():
+def fetch_turbulence_data(end_date=None):
     """
     Fetches live data for economic growth, inflation, sectors, and currencies.
     This version is corrected to be robust against yfinance download failures.
     """
-    end_date = datetime.now()
+    end_date = _analysis_end_datetime() if end_date is None else pd.Timestamp(end_date).to_pydatetime()
     start_date = "1990-01-01"
     empty_df = pd.DataFrame()
 
@@ -1017,7 +1105,7 @@ def fetch_and_organize_deep_dive_data(_ticker_symbol):
             for name, p in periods.items():
                 try:
                     if name == 'YTD':
-                        current_year_prices = close_prices[close_prices.index.year == datetime.now().year] # Get prices for current year
+                        current_year_prices = close_prices[close_prices.index.year == _analysis_year()] # Get prices for current year
                         if not current_year_prices.empty: # Added check for empty current_year_prices
                             ytd_start_price = current_year_prices.iloc[0]
                             perf_data[name] = (close_prices.iloc[-1] / ytd_start_price - 1) * 100 if ytd_start_price > 0 else np.nan
@@ -1296,12 +1384,15 @@ def fetch_etf_history(ticker, period="3y"):
 def fetch_all_etf_histories(_etf_list, period="3y"):
     etf_histories = {}
     with ThreadPoolExecutor(max_workers=6) as executor:
-        future_to_etf = {executor.submit(fetch_etf_history, etf, period): etf for etf in _etf_list}
+        future_to_etf = {executor.submit(fetch_etf_history, etf, period): etf for etf in sorted(_etf_list)}
         for future in tqdm(as_completed(future_to_etf), total=len(_etf_list), desc="Fetching ETF Histories"):
             etf = future_to_etf[future]
-            try: etf_histories[etf] = future.result()
-            except Exception as e: logging.error(f"Failed to fetch ETF history for {etf}: {e}")
-    return etf_histories
+            try:
+                etf_histories[etf] = future.result()
+            except Exception as e:
+                logging.error(f"Failed to fetch ETF history for {etf}: {e}")
+    return {k: etf_histories[k] for k in sorted(etf_histories)}
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_ticker_data(ticker_symbol):
@@ -1414,7 +1505,6 @@ def calculate_fmp_weights(returns_df, new_factor_returns, cov_matrix, existing_f
         if ortho_factor_series.std() < 1e-6: # Added check for constant factor
             logging.warning("FMP: Orthogonalized factor has no variance. Returning equal weights.")
             return pd.Series(np.ones(len(tickers)) / len(tickers), index=tickers)
-
 
         # Estimate the betas of assets to the (orthogonalized) factor
         betas = []
@@ -1560,7 +1650,6 @@ def calculate_information_metrics(forecasted_alphas_ts, portfolio_returns_ts, be
             logging.warning("One or more essential columns ('alpha_forecast', 'portfolio_returns', 'benchmark_returns') missing after alignment. Skipping IC/IR.")
             return np.nan, np.nan
 
-
         alpha_forecast = aligned_df['alpha_forecast']
         portfolio_returns = aligned_df['portfolio_returns']
         benchmark_returns = aligned_df['benchmark_returns']
@@ -1638,7 +1727,6 @@ def decompose_portfolio_risk(portfolio_returns_df, weights_df, factor_returns_df
             logging.warning("All factor returns have zero variance. Assuming all risk is specific.")
             return total_variance, 0.0, total_variance
 
-
         betas_df = pd.DataFrame(index=aligned_stock_returns.columns, columns=X_filtered.columns)
         for ticker in aligned_stock_returns.columns:
             model = Ridge(alpha=0.1).fit(X_filtered, aligned_stock_returns[ticker])
@@ -1686,21 +1774,6 @@ def calculate_garch_volatility(returns, window=252, dist='t'):
         logging.warning(f"GARCH for {returns.name if isinstance(returns, pd.Series) else 'N/A'} failed: {e}. Falling back to simple historical vol.") # Added logging
         return returns[-window:].std() * np.sqrt(252)
         
-@lru_cache(maxsize=1024)
-def calculate_returns_cached(ticker, periods_tuple):
-    periods = list(periods_tuple)
-    try:
-        history = yf.Ticker(ticker).history(period="2y", auto_adjust=True)
-        if history.empty or len(history) < max(p for p in periods if p is not None): return {f"Return_{p}d": np.nan for p in periods}
-        returns = {}
-        for period in periods:
-            if len(history) > period:
-                returns[f"Return_{period}d"] = (history['Close'].iloc[-1] / history['Close'].iloc[-(period+1)] - 1) * 100
-            else:
-                returns[f"Return_{period}d"] = np.nan
-        return returns
-    except Exception: return {f"Return_{p}d": np.nan for p in periods}
-
 def calculate_log_log_utility(returns):
     if returns.empty or returns.isna().all(): return np.nan
     try:
@@ -2210,7 +2283,6 @@ def calculate_relative_carry(results_df):
 
     return results_df
 
-
 # ADD THIS NEW, COMBINED FUNCTION
 def aggregate_stability_and_set_weights(stability_results, all_metrics, reverse_metric_map):
     """
@@ -2530,9 +2602,8 @@ def calculate_pure_returns(df, characteristics, target='Return_252d', vif_thresh
     for col in X.columns:
         if X[col].isna().any():
             X[col] = X[col].fillna(X[col].median())
-        # Add small noise to constant columns to ensure ranking works
-        if X[col].var() < 1e-8: 
-            X[col] = X[col] + np.random.normal(0, 1e-6, len(X))
+        if X[col].var() < 1e-8:
+            X = X.drop(columns=[col])
 
     # --- Implement Factor Neutralization (Proxy: Sector Neutralization) ---
     # Although true rank neutralization is complex, we can use residuals from sector regression
@@ -2602,7 +2673,6 @@ def calculate_ewma_volatility(returns_series, span=63, annualize=True):
     # Reindex to original returns series to maintain length, filling initial NaNs
     return ewma_vol.reindex(returns_series.index, method='ffill').bfill()
 
-
 @lru_cache(maxsize=1024)
 def calculate_returns_cached(ticker, periods_tuple):
     periods = list(periods_tuple)
@@ -2620,12 +2690,11 @@ def calculate_returns_cached(ticker, periods_tuple):
                 # Calculate simple percentage return (current / past - 1)
                 returns[f"Return_{period}d"] = (history['Close'].iloc[-1] / history['Close'].iloc[-(period+1)] - 1) * 100
             else:
-                returns[f"Return_{period}d":] = np.nan # Corrected slicing for assignment
+                returns[f"Return_{period}d"] = np.nan
         return returns
     except Exception as e:
         logging.error(f"Error calculating returns for {ticker} for periods {periods_tuple}: {e}")
         return {f"Return_{p}d": np.nan for p in periods}
-
 
 def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
     try:
@@ -2828,7 +2897,10 @@ def process_single_ticker(ticker_symbol, etf_histories, sector_etf_map):
 def process_tickers(_tickers, _etf_histories, _sector_etf_map):
     results, returns_dict, failed_tickers = [], {}, []
     with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_ticker = {executor.submit(process_single_ticker, ticker, _etf_histories, _sector_etf_map): ticker for ticker in _tickers}
+        future_to_ticker = {
+            executor.submit(process_single_ticker, ticker, _etf_histories, _sector_etf_map): ticker
+            for ticker in sorted(_tickers)
+        }
         for future in tqdm(as_completed(future_to_ticker), total=len(_tickers), desc="Processing All Ticker Metrics"):
             ticker = future_to_ticker[future]
             try:
@@ -2845,8 +2917,10 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
                 failed_tickers.append(ticker)
             
     if not results:
-        return pd.DataFrame(columns=columns), failed_tickers, {} # Explicitly returned empty dict for returns_dict
-    
+        return pd.DataFrame(columns=columns), failed_tickers, {}
+
+    # Sort by ticker for deterministic row order after concurrent fetch
+    results.sort(key=lambda row: row[columns.index('Ticker')] if row else '')
     results_df = pd.DataFrame(results, columns=columns)
     
     numeric_cols = [c for c in columns if c not in ['Ticker', 'Name', 'Sector', 'Best_Factor', 'Risk_Flag']]
@@ -2858,10 +2932,9 @@ def process_tickers(_tickers, _etf_histories, _sector_etf_map):
         else:
             median_val = results_df[col].median()
             results_df[col] = results_df[col].fillna(median_val) # Direct assignment
-
-        if results_df[col].var() < 1e-8: # Add small noise to constant columns
-            results_df[col] += np.random.normal(0, 0.01, len(results_df))
+        # Constant columns left unchanged for deterministic runs
     
+    returns_dict = {k: returns_dict[k] for k in sorted(returns_dict)}
     return results_df.infer_objects(copy=False), failed_tickers, returns_dict
 # REPLACE THE BODY of run_factor_stability_analysis with this new logic
 @st.cache_data
@@ -3012,7 +3085,7 @@ def calculate_ideal_weights(factor_rankings, etf_histories, df, pure_returns=Non
     valid_factors = factor_rankings[factor_rankings['Avg_Rank'] < rank_threshold].copy()
     if valid_factors.empty:
         valid_factors = factor_rankings.copy()
-        valid_factors['Avg_Rank'] = valid_factors['Avg_Rank'].fillna(1.0) + np.random.uniform(0.1, 0.5, len(valid_factors))
+        valid_factors['Avg_Rank'] = valid_factors['Avg_Rank'].fillna(valid_factors['Avg_Rank'].median() if valid_factors['Avg_Rank'].notna().any() else 1.0)
 
     valid_factors['Inverse_Corr_Rank'] = 1 / valid_factors['Avg_Rank'].replace(0, 1e-6)
     total_inverse_corr_rank = valid_factors['Inverse_Corr_Rank'].sum() or 1e-6
@@ -3025,7 +3098,7 @@ def calculate_ideal_weights(factor_rankings, etf_histories, df, pure_returns=Non
         total_inverse_pure_rank = sum(pure_return_ranks.values()) or 1e-6
     else:
         total_inverse_pure_rank = len(all_metrics)
-        pure_return_ranks = {long_to_short_map.get(m, m): 1.0 + np.random.uniform(0.1, 0.5) for m in all_metrics}
+        pure_return_ranks = {long_to_short_map.get(m, m): 1.0 for m in all_metrics}
 
     weights = {}
     for long_name in all_metrics:
@@ -3081,14 +3154,11 @@ def analyze_factor_correlations(df, returns_dict):
         logging.warning("No valid data for correlation after NaN/inf cleaning. Returning empty results.")
         return df, pd.DataFrame(), pd.DataFrame(columns=['Avg_Rank']).fillna(1.0)
 
-
     for col in valid_data.columns:
         median_val = valid_data[col].median()
         # FIX: Replaced inplace=True with direct reassignment
         valid_data[col] = valid_data[col].fillna(median_val)
-        
-        if valid_data[col].var() < 1e-6: # Add small noise to constant columns
-            valid_data[col] = valid_data[col] + np.random.normal(0, 0.01, len(valid_data))
+        # Constant columns left unchanged for deterministic runs
 
     if valid_data.empty or len(valid_data) < 2:
         logging.warning("Insufficient valid data for correlation. Returning empty results.")
@@ -3100,7 +3170,6 @@ def analyze_factor_correlations(df, returns_dict):
             logging.warning("Only one valid numeric column left for correlation. Cannot compute matrix.")
             # Changed the index to reflect the single remaining column
             return df, pd.DataFrame(), pd.DataFrame(index=[valid_data.columns[0]], columns=['Avg_Rank']).fillna(1.0) 
-
 
         corr_matrix = np.corrcoef(valid_data.T, rowvar=True)
         corr_matrix = np.where(np.isfinite(corr_matrix), corr_matrix, 0.0)
@@ -3813,7 +3882,6 @@ def calculate_terminal_wealth_metrics(
     time_h_years = int(time_horizon_years) if pd.notna(time_horizon_years) else np.nan
     rf_rate = float(risk_free_rate) if pd.notna(risk_free_rate) else np.nan
 
-
     # --- Primary Validation: Check for essential numeric inputs ---
     if not all(np.isfinite([p_sharpe, bm_sharpe, p_idio_var_n1_avg, comp_target_vol, lev_f, time_h_years])):
         logging.warning("TWR/Prob Losing: Essential numeric inputs are non-finite after conversion. Returning NaN.")
@@ -4169,7 +4237,7 @@ def main():
     # --- 2. Data Fetching and Initial Processing ---
     with st.spinner("Fetching histories and processing universe..."):
         etf_histories = fetch_all_etf_histories(etf_list)
-        macro_data = fetch_macro_data()
+        macro_data = fetch_macro_data(end_date=_analysis_end_datetime())
         results_df, failed_tickers, returns_dict = process_tickers(
             tickers, etf_histories, sector_etf_map
         )
