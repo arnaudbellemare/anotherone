@@ -4111,32 +4111,40 @@ def main():
         "Hedging Conservatism (Lambda)", 0.1, 5.0, 0.5, 0.1
     )
 
-        with st.spinner("Fetching histories and processing universe..."):
-            etf_histories = fetch_all_etf_histories(etf_list)
-            macro_data = fetch_macro_data()
-            results_df, failed_tickers, returns_dict = process_tickers(tickers, etf_histories, sector_etf_map)
+    # --- 2. Data Fetching and Initial Processing ---
+    with st.spinner("Fetching histories and processing universe..."):
+        etf_histories = fetch_all_etf_histories(etf_list)
+        macro_data = fetch_macro_data()
+        results_df, failed_tickers, returns_dict = process_tickers(
+            tickers, etf_histories, sector_etf_map
+        )
 
-        if results_df.empty:
-            st.error("Fatal Error: No tickers could be processed."); st.stop()
+    if results_df.empty:
+        st.error("Fatal Error: No tickers could be processed.")
+        st.stop()
 
-# NEW: apply factor weights on z-scored factors
-        results_df = apply_weighted_score(results_df, default_weights)
+    # NEW: apply factor weights on z-scored factors
+    results_df = apply_weighted_score(results_df, default_weights)
 
-# --- 3. Data Cleaning & Advanced Signals ---
-        with st.spinner("Applying Winsorization and Generating Advanced Signals..."):
+    # --- 3. Data Cleaning & Advanced Signals ---
+    with st.spinner("Applying Winsorization and Generating Advanced Signals..."):
         # Winsorize log returns for signal stability
-        winsorized_returns_dict = winsorize_returns(returns_dict, lookback_T=126, d_max=7.0)
+        winsorized_returns_dict = winsorize_returns(
+            returns_dict, lookback_T=126, d_max=7.0
+        )
         
         # Calculate Carry (Yields)
         results_df = calculate_relative_carry(results_df)
         
         # Calculate Cross-Sectional Mean Reversion
         if winsorized_returns_dict:
-            normalized_prices = get_all_prices_and_vols(list(winsorized_returns_dict.keys()), winsorized_returns_dict)
+            normalized_prices = get_all_prices_and_vols(
+                list(winsorized_returns_dict.keys()),
+                winsorized_returns_dict
+            )
             results_df = calculate_cs_mean_reversion(results_df, normalized_prices)
         else:
-            results_df['CS_Mean_Reversion'] = 0.0
-
+            results_df["CS_Mean_Reversion"] = 0.0
     # --- 4. EXECUTE SOPHISTICATED FACTOR ANALYSIS (The Brain) ---
     st.sidebar.subheader("Factor Weighting")
     with st.spinner("Executing Sophisticated Factor Analysis..."):
