@@ -29,7 +29,6 @@ from hmmlearn.hmm import GaussianHMM
 from sklearn.covariance import OAS
 from scipy.linalg import eigh
 import statsmodels.tsa.api as sm
-import pandas_datareader as pdr
 # Add these to your main script's import section
 import arch
 from sklearn.metrics import mean_absolute_error
@@ -61,6 +60,31 @@ def _analysis_end_str():
 def _analysis_year():
     return ANALYSIS_END_DATE.year
 
+
+def fetch_fred_series(series_id, start=None, end=None):
+    """
+    Fetch one FRED series via the public graph CSV endpoint.
+    Avoids pandas_datareader, which breaks on Python 3.13+.
+    """
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+    df = pd.read_csv(url)
+    date_col, value_col = df.columns[0], df.columns[1]
+    df[date_col] = pd.to_datetime(df[date_col])
+    df[value_col] = pd.to_numeric(df[value_col].replace(".", np.nan), errors="coerce")
+    out = df.set_index(date_col)[[value_col]].rename(columns={value_col: series_id})
+    if start is not None:
+        out = out.loc[pd.Timestamp(start) :]
+    if end is not None:
+        out = out.loc[: pd.Timestamp(end)]
+    return out
+
+
+def fetch_fred_dataframe(series_ids, start=None, end=None):
+    """Fetch and join multiple FRED series."""
+    if isinstance(series_ids, str):
+        series_ids = [series_ids]
+    frames = [fetch_fred_series(sid, start=start, end=end) for sid in series_ids]
+    return pd.concat(frames, axis=1) if frames else pd.DataFrame()
 
 
 # --- Data Structures and Mappings ---
@@ -969,10 +993,8 @@ def fetch_macro_data(start_date="2018-01-01", end_date=None):
     try:
         end_date = _analysis_end_datetime() if end_date is None else pd.Timestamp(end_date).to_pydatetime()
         
-        # Fetch 10-Year Treasury Yield (Interest Rates)
-        ten_year_yield = pdr.DataReader('DGS10', 'fred', start_date, end_date) # Explicitly used pdr.DataReader
-        # Fetch St. Louis Fed Financial Stress Index (centered at 0)
-        stress_index = pdr.DataReader('STLFSI3', 'fred', start_date, end_date) # Explicitly used pdr.DataReader
+        ten_year_yield = fetch_fred_series('DGS10', start=start_date, end=end_date)
+        stress_index = fetch_fred_series('STLFSI3', start=start_date, end=end_date)
         
         macro_df = pd.concat([ten_year_yield, stress_index], axis=1)
         macro_df.columns = ['Interest_Rate', 'Stress_Index']
@@ -1004,8 +1026,7 @@ def fetch_turbulence_data(end_date=None):
             'GNPC96': 'Economic Growth', # Real Gross National Product, Quarterly
             'CPIAUCSL': 'Inflation'       # Consumer Price Index, Monthly
         }
-        # Explicitly set FRED as source
-        econ_df = pdr.DataReader(list(fred_tickers.keys()), 'fred', "1947-01-01", end_date) # Used pdr.DataReader
+        econ_df = fetch_fred_dataframe(list(fred_tickers.keys()), start="1947-01-01", end=end_date)
         econ_df = econ_df.rename(columns=fred_tickers)
         econ_growth = econ_df[['Economic Growth']].dropna().pct_change() * 100
         inflation = econ_df[['Inflation']].dropna().pct_change() * 100
